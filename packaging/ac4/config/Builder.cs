@@ -36,8 +36,10 @@ static class Builder
     // Bump when the build recipe changes: every PC then recompiles once.
     public const int RecipeVersion = 3;   // 3: -march=native again, compiled on each PC
 
+    // python: tools/ps2recomp and tools/vurecomp generate the game's code from
+    // the player's SLUS_201.52 when the package does not carry it
     public static readonly string[] Packages = {
-        "gcc", "cmake", "ninja", "pkgconf", "sdl3", "shaderc", "vulkan-headers", "vulkan-loader" };
+        "gcc", "cmake", "ninja", "pkgconf", "sdl3", "shaderc", "vulkan-headers", "vulkan-loader", "python", "python-pillow" };
     const string PkgPrefix = "mingw-w64-ucrt-x86_64-";
     const string MsysUrl = "https://repo.msys2.org/distrib/msys2-x86_64-latest.sfx.exe";
 
@@ -63,9 +65,103 @@ static class Builder
         Ucrt = Path.Combine(Msys, "ucrt64");
     }
 
+    // the public download has no generated\ (the recompiled game code): it is
+    // made on the player's PC from SLUS_201.52, which the setup copies from
+    // the player's disc into the source folder
+    public static string ElfPath { get { return Path.Combine(Src, "SLUS_201.52"); } }
+    public static bool CanGenerate
+    {
+        get { return File.Exists(ElfPath) && Directory.Exists(Path.Combine(Src, "tools", "ps2recomp")); }
+    }
     public static bool SourceAvailable
     {
-        get { return File.Exists(Path.Combine(Src, "CMakeLists.txt")) && Directory.Exists(Path.Combine(Src, "generated")); }
+        get { return File.Exists(Path.Combine(Src, "CMakeLists.txt")) && (Directory.Exists(Path.Combine(Src, "generated")) || CanGenerate); }
+    }
+
+    // what the generated code is made from: the recompilers and their config
+    public static string GeneratorHash()
+    {
+        var files = new List<string>();
+        foreach (string d in new[] { Path.Combine("tools", "ps2recomp"), Path.Combine("tools", "vurecomp"), Path.Combine("config", "ac4") })
+        {
+            string full = Path.Combine(Src, d);
+            if (Directory.Exists(full))
+                files.AddRange(Directory.GetFiles(full, "*.*", SearchOption.AllDirectories)
+                                        .Where(f => f.EndsWith(".py") || f.EndsWith(".json")));
+        }
+        string vu = Path.Combine(Src, "tools", "ac4_vu1.py");
+        if (File.Exists(vu)) files.Add(vu);
+        files.Sort(StringComparer.OrdinalIgnoreCase);
+        using (var sha = SHA1.Create())
+        {
+            var buf = new MemoryStream();
+            foreach (string f in files)
+            {
+                byte[] n = Encoding.UTF8.GetBytes(f.Substring(Src.Length).Replace('\\', '/') + "\n");
+                buf.Write(n, 0, n.Length);
+                byte[] b = File.ReadAllBytes(f);
+                buf.Write(b, 0, b.Length);
+            }
+            return BitConverter.ToString(sha.ComputeHash(buf.ToArray())).Replace("-", "").ToLowerInvariant();
+        }
+    }
+    // The Spanish mod normally comes ready in the download; when the game has
+    // none, it is made here from the player's ISO with only our translation
+    // (tools/ac4_espanol_mod.py): the engine applies its patches when the
+    // game reads the disc.
+    public static string SpanishModDir { get { return Path.Combine(Game, "mods", "espanol"); } }
+    public static string IsoFile
+    {
+        get
+        {
+            try
+            {
+                string p = File.ReadAllText(Path.Combine(Game, "launcher-iso.txt")).Trim();
+                return File.Exists(p) ? p : null;      // a disc folder: not supported by the tools
+            }
+            catch { return null; }
+        }
+    }
+    // mod files made from the game's data (tools/ac4_mods_from_disc.py): the
+    // Spanish mod and mision_libre's hangar menu patch
+    public static bool NeedsSpanishMod
+    {
+        get
+        {
+            if (!File.Exists(Path.Combine(Src, "tools", "ac4_mods_from_disc.py")) || !File.Exists(ElfPath) || IsoFile == null)
+                return false;
+            string mods = Path.GetDirectoryName(SpanishModDir);
+            return (Directory.Exists(Path.Combine(Src, "localization", "es-419-propio", "es"))
+                    && !Directory.Exists(Path.Combine(SpanishModDir, "files", "BIN")))
+                || (File.Exists(Path.Combine(mods, "mision_libre", "mod.toml"))
+                    && !File.Exists(Path.Combine(mods, @"mision_libre\files\BIN\DATA.CDP.0272.PARTS")));
+        }
+    }
+    // HD menu textures made on this PC (tools/ac4_hd_menus.py) from a hidden
+    // boot of the game to its title screen
+    public static string HdMenusDir { get { return Path.Combine(Runtime, "textures", "hd", "menus-generado"); } }
+    public static bool NeedsHdMenus
+    {
+        get
+        {
+            // only where there is no texture pack at all: a player's own pack
+            // (or one made before) is never touched
+            return File.Exists(Path.Combine(Src, "tools", "ac4_hd_menus.py")) && IsoFile != null
+                && File.Exists(ElfPath) && !Directory.Exists(Path.Combine(Runtime, "textures", "hd"));
+        }
+    }
+    public static string GeneratedStamp { get { return Path.Combine(Src, "generated", "generated.stamp"); } }
+
+    // true when generated\ must be (re)made from the player's executable
+    public static bool NeedsGenerate
+    {
+        get
+        {
+            if (!CanGenerate) return false;
+            if (!File.Exists(Path.Combine(Src, "generated", "ps2_funcs.h"))) return true;
+            try { return File.ReadAllText(GeneratedStamp).Trim() != GeneratorHash(); }
+            catch { return true; }
+        }
     }
     public static string StampPath { get { return Path.Combine(Runtime, "ac4_build.stamp"); } }
     public static string GameExe { get { return Path.Combine(Runtime, "ac4.exe"); } }
@@ -233,7 +329,9 @@ static class Builder
     public static string RebuildReason()
     {
         if (!SourceAvailable) return null;
-        if (!File.Exists(GameExe)) return "Todavía no hay una versión compilada del juego.";
+        if (!File.Exists(GameExe)) return "Primera ejecución: se genera el código del juego desde tu disco y se compila para tu PC.";
+        if (NeedsGenerate) return "Cambió el recompilador del port: se vuelve a generar el código del juego.";
+        if (NeedsSpanishMod) return "Faltan datos de los mods (español, misión libre): se generan desde tu disco.";
         // AC4Recomp-desarrollo\COMPILACION_MANUAL.txt: the developer installs each
         // build by hand (COMPILAR.bat), so a source edit must not recompile on
         // play -- but new hardware or a new graphics driver still does
@@ -370,11 +468,17 @@ class BuildJob
             }
             if (Builder.MissingPackages().Count > 0)
                 steps.Add(new Step { Name = "Instalando dependencias", Weight = 18, Run = InstallPackages });
+            if (Builder.NeedsGenerate)
+                steps.Add(new Step { Name = "Generando el código del juego desde tu disco", Weight = 3, Run = Generate });
+            if (Builder.NeedsSpanishMod)
+                steps.Add(new Step { Name = "Generando los datos de los mods desde tu disco", Weight = 6, Run = ModsFromDisc });
             steps.Add(new Step { Name = "Borrando la compilación anterior", Weight = 1.5, Run = Clean });
             steps.Add(new Step { Name = "Configurando para este hardware", Weight = 3, Run = Configure });
             steps.Add(new Step { Name = "Compilando el juego", Weight = 86, Run = Compile });
             steps.Add(new Step { Name = "Instalando", Weight = 2, Run = Install });
             steps.Add(new Step { Name = "Optimizando shaders para tu GPU", Weight = 4, Run = Precompile });
+            if (Builder.NeedsHdMenus)
+                steps.Add(new Step { Name = "Preparando las texturas HD de los menús", Weight = 4, Run = HdMenus });
 
             double total = steps.Sum(s => s.Weight), done = 0;
             foreach (var st in steps)
@@ -427,6 +531,8 @@ class BuildJob
         psi.StandardErrorEncoding = Encoding.UTF8;
         psi.WorkingDirectory = dir;
         psi.EnvironmentVariables.Remove("VULKAN_SDK");   // build against the MSYS2 Vulkan packages
+        psi.EnvironmentVariables.Remove("PYTHONHOME");   // the MSYS2 Python, not another one
+        psi.EnvironmentVariables.Remove("PYTHONPATH");
         if (env != null) foreach (var kv in env) psi.EnvironmentVariables[kv.Key] = kv.Value;
         using (var p = new Process { StartInfo = psi })
         {
@@ -532,6 +638,65 @@ class BuildJob
     }
 
     // ------------------------------------------------------------ build
+
+    // generated\ from the player's SLUS_201.52: tools/ps2recomp for the EE
+    // code, tools/ac4_vu1.py + tools/vurecomp for the VU1 microprograms.
+    // Written beside it first, so a failure never leaves half a folder.
+    void Generate(Action<double> p)
+    {
+        string py = Path.Combine(Builder.Ucrt, "bin", "python.exe");
+        if (!File.Exists(py)) throw new Exception("Falta Python en las herramientas de compilación: reinstala el juego");
+        string gen = Path.Combine(Builder.Src, "generated"), tmp = gen + ".new", vu = Path.Combine(BuildDir, "vu_programs");
+        foreach (string d in new[] { tmp, vu }) if (Directory.Exists(d)) Directory.Delete(d, true);
+        Directory.CreateDirectory(BuildDir);
+        var env = ToolEnv();
+        env["PYTHONPATH"] = Path.Combine(Builder.Src, "tools");
+        env["PYTHONDONTWRITEBYTECODE"] = "1";
+        env["PYTHONUTF8"] = "1";
+        string elf = "\"" + Builder.ElfPath + "\"";
+        int lines = 0;
+        Must(Exec(py, "-s -m ps2recomp " + elf + " -o \"" + tmp + "\"" +
+                      " --ida-db config/ac4/ida_db.json --ida-seeds config/ac4/seeds.json" +
+                      " --symbols config/ac4/sdk_symbols.json --symbols config/ac4/manual_symbols.json" +
+                      " --overrides config/ac4/overrides.json --hooks config/ac4/hooks.json" +
+                      " --report \"" + Path.Combine(BuildDir, "recomp-report.json") + "\"",
+                  Builder.Src, env, s => { lines++; p(Math.Min(0.7, lines / 9000.0)); }),
+             "No se pudo generar el código del juego");
+        p(0.75);
+        Must(Exec(py, "-s tools/ac4_vu1.py build config/ac4/vu1_recipe.json " + elf + " \"" + vu + "\"", Builder.Src, env, null),
+             "No se pudieron leer los microprogramas VU1 del juego");
+        Must(Exec(py, "-s -m vurecomp --programs \"" + vu + "\" -o \"" + Path.Combine(tmp, "ps2_vu1_progs.inc") + "\"",
+                  Builder.Src, env, null), "No se pudieron generar los microprogramas VU1");
+        if (!File.Exists(Path.Combine(tmp, "ps2_funcs.h"))) throw new Exception("La generación del código no terminó");
+        File.WriteAllText(Path.Combine(tmp, "generated.stamp"), Builder.GeneratorHash(), new UTF8Encoding(false));
+        if (Directory.Exists(gen)) Directory.Delete(gen, true);
+        Directory.Move(tmp, gen);
+        try { Directory.Delete(vu, true); } catch { }
+        p(1);
+    }
+
+    // never stops the game: without these files it plays in English and
+    // mision_libre only skips its hangar menu fix
+    void ModsFromDisc(Action<double> p)
+    {
+        string py = Path.Combine(Builder.Ucrt, "bin", "python.exe");
+        string mod = Path.GetDirectoryName(Builder.SpanishModDir);
+        bool on = false;
+        try { on = File.ReadAllText(Path.Combine(Builder.Game, "launcher-language.txt")).Trim() == "es"; } catch { }
+        var env = ToolEnv();
+        env["PYTHONDONTWRITEBYTECODE"] = "1";
+        env["PYTHONUTF8"] = "1";
+        int lines = 0;
+        try
+        {
+            int rc = Exec(py, "-s tools/ac4_mods_from_disc.py \"" + Builder.IsoFile + "\" \"" + Builder.ElfPath + "\" \"" + mod + "\" " + (on ? "on" : "off"),
+                          Builder.Src, env, s => { lines++; p(Math.Min(0.95, lines / 6.0)); });
+            if (rc != 0) Log("some mod files could not be made from the disc (exit " + rc + ")");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { Log("the mod files could not be made from the disc: " + e.Message); }
+        p(1);
+    }
 
     string BuildDir { get { return Path.Combine(Builder.Src, "build"); } }
     string ReleaseDir { get { return Path.Combine(BuildDir, "release"); } }
@@ -795,6 +960,57 @@ class BuildJob
                 queue.Enqueue(src);
             }
         }
+    }
+
+    // the game runs once, hidden and silent, from boot to the title screen,
+    // saving the textures it draws; tools/ac4_hd_menus.py scales them 4x into
+    // textures\hd\menus-generado.  Saves, settings and caches go to a temporary
+    // folder.  Never stops the game: without them the originals are drawn.
+    void HdMenus(Action<double> p)
+    {
+        string tmp = Path.Combine(Path.GetTempPath(), "mobius01-hd-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string dump = Path.Combine(tmp, "dump");
+            Directory.CreateDirectory(dump);
+            var env = new Dictionary<string, string>();
+            env["PS2_SHADER_DIR"] = Path.Combine(Builder.Runtime, "shaders");
+            env["PS2_TEXTURE_PACK"] = "off";
+            env["PS2_TEXTURE_DUMP"] = dump;
+            env["PS2_SAVE_DIR"] = Path.Combine(tmp, "saves");
+            env["PS2_SETTINGS_FILE"] = Path.Combine(tmp, "settings.ini");
+            env["PS2_PIPELINE_CACHE"] = Path.Combine(tmp, "pipelines");
+            env["PS2_MOD_DIR"] = Path.Combine(Builder.Game, "mods");
+            env["SDL_AUDIO_DRIVER"] = "dummy";
+            string image = Path.GetFullPath(Path.Combine(Builder.Runtime, @"..\..\gamedata\ps2_image.bin"));
+            if (File.Exists(image)) env["PS2_IMAGE"] = image;
+            int lines = 0;
+            int rc = Exec(Builder.GameExe, "--data \"" + Builder.Runtime + "\" --disc \"" + Builder.IsoFile +
+                          "\" --hidden --vblanks 1300 --watchdog 0", tmp, env, s => { lines++; p(Math.Min(0.7, lines / 400.0)); });
+            if (rc != 0) Log("the hidden run for the HD menus ended with " + rc);
+            p(0.75);
+            var penv = ToolEnv();
+            penv["PYTHONDONTWRITEBYTECODE"] = "1";
+            string staging = Builder.HdMenusDir + ".new";
+            if (Directory.Exists(staging)) Directory.Delete(staging, true);
+            rc = Exec(Path.Combine(Builder.Ucrt, "bin", "python.exe"),
+                      "-s tools/ac4_hd_menus.py \"" + dump + "\" \"" + staging + "\"", Builder.Src, penv, null);
+            if (rc == 0 && Directory.Exists(staging) && Directory.GetFiles(staging, "*.pam").Length > 0)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Builder.HdMenusDir));
+                Directory.Move(staging, Builder.HdMenusDir);
+            }
+            else
+            {
+                Log("no HD menu textures were made");
+                try { if (Directory.Exists(staging)) Directory.Delete(staging, true); } catch { }
+                try { Directory.Delete(Path.GetDirectoryName(Builder.HdMenusDir)); } catch { }   // only if empty
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { Log("HD menu textures not made: " + e.Message); }
+        finally { try { Directory.Delete(tmp, true); } catch { } }
+        p(1);
     }
 
     void Precompile(Action<double> p)

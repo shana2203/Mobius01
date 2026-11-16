@@ -56,7 +56,10 @@ internal static class InstallerCore
         throw new InvalidDataException("This is not the supported Ace Combat 04 USA ISO: missing " + name + ".");
     }
 
-    internal static byte[] ValidateIso(Stream iso)
+    internal static byte[] ValidateIso(Stream iso) { return BuildImage(IsoElf(iso)); }
+
+    // the checked SLUS_201.52 of an ISO
+    internal static byte[] IsoElf(Stream iso)
     {
         if (iso.Length < 17 * Sector || iso.Length % Sector != 0)
             throw new InvalidDataException("Select an uncompressed ISO with 2048-byte sectors.");
@@ -82,12 +85,14 @@ internal static class InstallerCore
             if (actual != ElfHash)
                 throw new InvalidDataException("The game executable does not match SLUS-20152. Modified or different-revision ISOs are not supported.");
         }
-        return BuildImage(elf);
+        return elf;
     }
 
     // the same checks on a folder holding the disc's files (SYSTEM.CNF,
     // SLUS_201.52...), which the game can also play from
-    internal static byte[] ValidateDiscFolder(string dir)
+    internal static byte[] ValidateDiscFolder(string dir) { return BuildImage(FolderElf(dir)); }
+
+    internal static byte[] FolderElf(string dir)
     {
         string cnf = Path.Combine(dir, "SYSTEM.CNF"), exe = Path.Combine(dir, "SLUS_201.52");
         if (!File.Exists(cnf) || !File.Exists(exe))
@@ -102,14 +107,17 @@ internal static class InstallerCore
             if (actual != ElfHash)
                 throw new InvalidDataException("The game executable does not match SLUS-20152. Modified or different-revision discs are not supported.");
         }
-        return BuildImage(elf);
+        return elf;
     }
 
     // an ISO file or a disc folder
-    internal static byte[] ValidateDisc(string path)
+    internal static byte[] ValidateDisc(string path) { return BuildImage(DiscElf(path)); }
+
+    // the checked SLUS_201.52 of an ISO file or a disc folder
+    internal static byte[] DiscElf(string path)
     {
-        if (Directory.Exists(path)) return ValidateDiscFolder(path);
-        using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)) return ValidateIso(f);
+        if (Directory.Exists(path)) return FolderElf(path);
+        using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)) return IsoElf(f);
     }
 
     internal static byte[] BuildImage(byte[] elf)

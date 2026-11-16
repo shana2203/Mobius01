@@ -50,6 +50,31 @@ licencia Apache 2.0, que se conserva junto con sus créditos (ver `NOTICE`,
   | `tienda_completa` | Tienda completa |
   | `cheats` | Cheats |
 
+## Descargar y jugar
+
+En [Releases](https://github.com/shana2203/Mobius01/releases) está el
+instalador `Mobius01-Setup-v<versión>.exe`. Necesitas tu propia ISO (o carpeta
+del disco) de **Ace Combat 04 de EE. UU. (SLUS-20152)**.
+
+1. El instalador copia el port, los mods (solo sus scripts) y las
+   herramientas de compilación (sin internet), y toma de tu disco el
+   ejecutable del juego.
+2. La primera vez que abres **Jugar** (unos minutos, solo una vez), todo lo
+   que sale del juego se genera en tu PC desde tu propia ISO:
+   - el código del juego, desde tu `SLUS_201.52` (`tools/ps2recomp`, y
+     `tools/ac4_vu1.py` + `tools/vurecomp` para los microprogramas VU1), que
+     luego se compila para tu procesador;
+   - el mod de español: nuestra traducción aplicada a los textos de tu disco,
+     el HUD y las tarjetas redibujados con sus propias letras
+     (`tools/ac4_mods_from_disc.py`);
+   - el parche del menú de `mision_libre`;
+   - las texturas HD de los menús: el juego arranca oculto hasta el título,
+     guarda las texturas que dibuja y nuestro filtro las amplía x4
+     (`tools/ac4_hd_menus.py`).
+
+La descarga no trae código, textos, imágenes ni ningún otro dato del juego, ni
+un ejecutable del juego ya compilado.
+
 ## Qué NO incluye (y por qué)
 
 Este repositorio no contiene nada del juego. Ace Combat 04 es de Bandai Namco,
@@ -86,6 +111,12 @@ Mobius01 is a fork-style continuation of
 [PresidentRaptor's Ace Combat 04 PC Port](https://github.com/PresidentRaptor/Ace-Combat-04-PC-Port),
 itself built on [sal063's Ace Combat 5 static recompilation](https://github.com/sal063/Ace-Combat-5-Static-recompilation)
 (Apache 2.0; their notices and credits are kept).
+
+Download the installer from Releases. It ships the port's source, the build
+tools and the mods' scripts, and no game code or data: on the first start the
+game's code, the Spanish mod, the free-mission menu patch and the HD menu
+textures (scaled 4x by our own filter) are all generated on your PC from your
+own ISO, and the game is compiled there.
 
 It adds:
 - a bilingual installer;

@@ -46,6 +46,15 @@ static class Product
     public const string Game = "Ace Combat 04: Shattered Skies";
     public const string LinkName = "Ace Combat 04 Shattered Skies";   // ':' is not allowed in file names
     public const string Key = "Mobius01";
+    // the public download (build_setup.ps1 -Release) carries neither the
+    // recompiled game code nor a prebuilt ac4.exe: Jugar.exe generates the code
+    // from the player's own SLUS_201.52 and compiles it, so the build tools
+    // are not optional
+#if SOURCE_FROM_DISC
+    public const bool ToolsRequired = true;
+#else
+    public const bool ToolsRequired = false;
+#endif
     public static string MsysDir
     {
         get
@@ -173,7 +182,7 @@ static class Deps
         string db = Path.Combine(Product.MsysDir, @"var\lib\pacman\local");
         if (Directory.Exists(db))
             foreach (string d in Directory.GetDirectories(db)) have.Add(PackageName(Path.GetFileName(d)));
-        return new[] { "gcc", "cmake", "ninja", "pkgconf", "sdl3", "shaderc", "vulkan-headers", "vulkan-loader" }
+        return new[] { "gcc", "cmake", "ninja", "pkgconf", "sdl3", "shaderc", "vulkan-headers", "vulkan-loader", "python", "python-pillow" }
             .Select(p => "mingw-w64-ucrt-x86_64-" + p).Where(p => !have.Contains(p)).ToList();
     }
 
@@ -397,15 +406,15 @@ class InstallJob
                                   L.T(" (incluido en Windows 10 1803 y posteriores).", " (included in Windows 10 1803 and later)."));
 
         Progress(0.01, L.T("Comprobando tu ISO", "Checking your ISO"), "Ace Combat 04 USA (SLUS-20152)");
-        byte[] image;
-        image = InstallerCore.ValidateDisc(Iso);   // an ISO or a folder with the disc's files
+        byte[] elf = InstallerCore.DiscElf(Iso);   // an ISO or a folder with the disc's files
+        byte[] image = InstallerCore.BuildImage(elf);
         Cancel.ThrowIfCancellationRequested();
 
         string temp = Path.Combine(Path.GetTempPath(), "mobius01-setup-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temp);
         try
         {
-            bool toolsNeeded = Tools && !Deps.ToolsReady;
+            bool toolsNeeded = (Tools || Product.ToolsRequired) && !Deps.ToolsReady;
             double gameEnd = toolsNeeded ? 0.30 : 0.92;
             // a fresh folder receives the files directly; an update unpacks
             // beside it and then replaces everything but the player's files
@@ -436,6 +445,12 @@ class InstallJob
                 gz.Write(image, 0, image.Length);
             string oldImage = Path.Combine(Dest, @"VulkanRuntime\runtime\ps2_image.bin");
             if (File.Exists(oldImage)) File.Delete(oldImage);   // where versions before 2026-11-16 put it
+            // a package without the recompiled code (the public download):
+            // Jugar.exe generates it from the player's own executable, kept
+            // next to the source
+            string src = Path.Combine(Dest, @"VulkanRuntime\source");
+            if (File.Exists(Path.Combine(src, "CMakeLists.txt")))
+                File.WriteAllBytes(Path.Combine(src, "SLUS_201.52"), elf);
             Directory.CreateDirectory(Path.Combine(Dest, @"VulkanRuntime\saves"));
             Directory.CreateDirectory(Path.Combine(Dest, @"VulkanRuntime\logs"));
             // the game plays from the player's ISO or disc folder, which is
@@ -864,7 +879,7 @@ class Wizard : Form
     {
         get
         {
-            return (900L << 20) + (ckTools.Checked ? (900L << 20) : 0) + (2000L << 20);
+            return (900L << 20) + (ckTools.Checked || Product.ToolsRequired ? (1000L << 20) : 0) + (2000L << 20);
         }
     }
 
@@ -937,11 +952,16 @@ class Wizard : Form
                                                                  "Vulkan is missing: install your graphics card driver")) +
                                (gpus.Count > 0 ? " · " + gpus[0] : ""));
         row(true, T("Bibliotecas del juego (SDL3, C/C++, shaders): incluidas", "Game libraries (SDL3, C/C++, shaders): included"));
+        if (Product.ToolsRequired)
+            row(true, tools ? T("Herramientas de compilación: ya instaladas", "Build tools: already installed")
+                            : T("Herramientas de compilación: se instalan (sin internet; el juego se compila en tu PC)",
+                                "Build tools: will be installed (no internet needed; the game is built on your PC)"));
+        else
         row(tools || ckTools.Checked, tools ? T("Herramientas de compilación: ya instaladas", "Build tools: already installed")
                                             : ckTools.Checked ? T("Herramientas de compilación: se instalan (sin internet)", "Build tools: will be installed (no internet needed)")
                                                               : T("Sin herramientas: se usará la versión genérica del juego", "No build tools: the generic version of the game is used"));
         depList.Text = sb.ToString();
-        ckTools.Visible = page == 3 && !tools;
+        ckTools.Visible = page == 3 && !tools && !Product.ToolsRequired;
         ckTools.Text = T("Instalar las herramientas para optimizar el juego para esta PC (recomendado)",
                          "Install the tools that optimize the game for this PC (recommended)");
         if (prompt && page == 3 && !Deps.VulkanLoader)
@@ -960,7 +980,7 @@ class Wizard : Form
         GoTo(4);
         clock.Restart();
         cts = new CancellationTokenSource();
-        job = new InstallJob { Iso = isoOk, Dest = tbDir.Text.Trim(), Tools = ckTools.Checked && !Deps.ToolsReady,
+        job = new InstallJob { Iso = isoOk, Dest = tbDir.Text.Trim(), Tools = (ckTools.Checked || Product.ToolsRequired) && !Deps.ToolsReady,
                                English = L.En, Cancel = cts.Token };
         job.Progress = (f, ph, d) => BeginInvoke((Action)(() => { if (f > target) target = f; phase = ph; detail = d ?? ""; }));
         try
@@ -1223,7 +1243,7 @@ class Wizard : Form
             page = p;
             if (p == 3) CheckDeps(false);
             for (int i = 0; i < pages.Length; i++) foreach (var c in pages[i]) c.Visible = i == p;
-            if (p == 3) { CheckDeps(false); ckTools.Visible = !Deps.ToolsReady; }
+            if (p == 3) { CheckDeps(false); ckTools.Visible = !Deps.ToolsReady && !Product.ToolsRequired; }
             bBack.Visible = p > 0 && p < 4; bCancel.Visible = p < 5; bNext.Visible = p != 4;
             bNext.Text = p == 3 ? T("Instalar", "Install") : p == 5 ? T("Finalizar", "Finish") : T("Siguiente  ›", "Next  ›");
             LayoutButtons();

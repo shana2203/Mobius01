@@ -1975,6 +1975,19 @@ static class Program
             BuildForm.Preview(args[1]);
             return 0;
         }
+        if (args.Contains("--build-headless"))
+        {
+            // automatic tests: the whole build with no window; the log is in
+            // VulkanRuntime\logs (build-*.log, and build-headless-error.txt)
+            Builder.Init(root);
+            if (Builder.RebuildReason() == null && !args.Contains("--compilar")) return 0;
+            try { new BuildJob().Run(); return 0; }
+            catch (Exception e)
+            {
+                try { File.WriteAllText(Path.Combine(Builder.Logs, "build-headless-error.txt"), e.ToString()); } catch { }
+                return 1;
+            }
+        }
         bool force = args.Contains("--compilar"), buildOnly = args.Contains("--solo-compilar");
         // "Jugar.exe diagnostico" (formerly JUGAR.bat diagnostico): frame timings CSV
         if (args.Any(a => a.Equals("diagnostico", StringComparison.OrdinalIgnoreCase)))

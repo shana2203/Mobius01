@@ -12,7 +12,12 @@ import os
 import subprocess
 import sys
 
-NEEDED = ["gcc", "cmake", "ninja", "pkgconf", "sdl3", "shaderc", "vulkan-headers", "vulkan-loader"]
+# python: runs tools/ps2recomp and tools/vurecomp, which make the game's code
+# from the player's own SLUS_201.52 (the download does not carry it)
+# python-pillow: tools/ac4_espanol_mod.py (the Spanish mod made from the disc
+# when the game has none) draws the translated cards and labels
+NEEDED = ["gcc", "cmake", "ninja", "pkgconf", "sdl3", "shaderc", "vulkan-headers", "vulkan-loader",
+          "python", "python-pillow"]
 PREFIX = "mingw-w64-ucrt-x86_64-"
 # never needed to compile or run the compiler
 SKIP_DIRS = ("share/doc/", "share/man/", "share/info/", "share/gtk-doc/", "share/locale/",
@@ -81,6 +86,11 @@ def main():
             continue
         sub = rel.split("/", 1)[1] if "/" in rel else rel
         if sub.startswith(SKIP_DIRS) or rel.endswith(".pyc"):
+            continue
+        # Python's own test suite, IDLE and Tk demos: never used by the recompilers
+        parts = sub.split("/")
+        if len(parts) > 2 and parts[0] == "lib" and parts[1].startswith("python3") and \
+                parts[2] in ("test", "idlelib", "tkinter", "turtledemo", "ensurepip", "lib2to3", "__pycache__"):
             continue
         if os.path.isfile(os.path.join(root, rel)):
             files.append(rel)
