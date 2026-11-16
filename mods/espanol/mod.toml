@@ -1,0 +1,5 @@
+name = "Español neutro"
+version = "0.1"
+author = "AC4Recomp"
+game = "SLUS-20152"
+enabled = false

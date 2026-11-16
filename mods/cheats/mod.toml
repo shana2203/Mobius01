@@ -1,0 +1,5 @@
+name     = "Cheats (launcher)"
+author   = "launcher de configuracion"
+priority = 100
+enabled = false
+game     = "SLUS-20152"

@@ -1,0 +1,125 @@
+{
+ "note": "Play-through cases for tools/ac4_playtest.py. Frames are present counts (find them with 'calibrate'). 'campana' needs this PC's save that loads mission 3 (Northern Eye) from file 1. 'box' is a crop as fractions (x0, y0, x1, y1). metric 'changed' = % of pixels that moved a lot, 'tint' = change of mean red-minus-green, 'mean' = mean absolute difference.",
+ "cases": [
+  {
+   "name": "campana",
+   "script": "900:START 1000:DOWN 1060:CROSS 1300:CROSS 1420:CROSS 1700:UP 1760:CROSS 1950:CROSS 2130:CROSS 2310:CROSS 2490:CROSS 2670:CROSS 2850:CROSS 3030:CROSS 3210:CROSS 3390:CROSS 3570:CROSS 3750:CROSS 3930:CROSS 4230:CROSS 4410:CROSS 4590:CROSS 4770:CROSS 4950:CROSS 5130:CROSS",
+   "vblanks": 4900,
+   "max": 0.5,
+   "shots": [
+    {
+     "frame": 1050,
+     "what": "titulo y su ayuda"
+    },
+    {
+     "frame": 1300,
+     "what": "cargar partida"
+    },
+    {
+     "frame": 1750,
+     "what": "menu tras cargar"
+    },
+    {
+     "frame": 3350,
+     "what": "panel del mapa",
+     "checks": [
+      {
+       "name": "panel",
+       "box": [
+        0.0,
+        0.05,
+        0.28,
+        0.25
+       ],
+       "max": 0.5
+      }
+     ]
+    },
+    {
+     "frame": 3700,
+     "what": "menu de mision"
+    },
+    {
+     "frame": 3900,
+     "what": "hangar F-16C",
+     "checks": [
+      {
+       "name": "tinte",
+       "box": [
+        0.3,
+        0.45,
+        0.75,
+        1.0
+       ],
+       "metric": "tint",
+       "max": 8
+      }
+     ]
+    },
+    {
+     "frame": 4150,
+     "what": "hangar bomba",
+     "checks": [
+      {
+       "name": "textos",
+       "box": [
+        0.0,
+        0.0,
+        0.3,
+        0.75
+       ],
+       "max": 1.0
+      },
+      {
+       "name": "tinte",
+       "box": [
+        0.3,
+        0.3,
+        0.75,
+        0.75
+       ],
+       "metric": "tint",
+       "max": 5
+      }
+     ]
+    },
+    {
+     "frame": 4420,
+     "what": "objetivos"
+    },
+    {
+     "frame": 4500,
+     "what": "HUD al empezar",
+     "checks": [
+      {
+       "name": "etiquetas",
+       "box": [
+        0.0,
+        0.02,
+        0.12,
+        0.12
+       ],
+       "max": 1.0
+      }
+     ]
+    },
+    {
+     "frame": 4800,
+     "what": "subtitulo de radio",
+     "checks": [
+      {
+       "name": "subtitulo",
+       "box": [
+        0.25,
+        0.07,
+        0.75,
+        0.2
+       ],
+       "max": 1.0
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

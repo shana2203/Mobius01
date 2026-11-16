@@ -1,0 +1,5201 @@
+#include "ps2_runtime.h"
+extern int ps2_gif_path;
+/* the GIF path of the data being drawn: with the GS on its own thread the
+   worker's ps2_gif_path runs ahead, so the GS thread keeps its own copy */
+extern int ps2_gsq_split, ps2_gsq_path;
+#define GS_PATH (ps2_gsq_split ? ps2_gsq_path : ps2_gif_path)
+#include "ps2_vk.h"
+#include "ps2_settings.h"
+#include "ps2_hle.h"
+#include "ps2_statecap.h"
+#include "ps2_capture.h"
+#include "rn.h"
+#include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
+#include <math.h>
+
+u64  ps2_gs_priv_read(u32 addr);
+void ps2_gs_priv_write(u32 addr, u64 val);
+void ps2_gs_write_reg(u32 reg, u64 val);
+void ps2_gfxq_drain(void);
+int  ps2_gfxq_field(void);
+extern int ps2_gfxq_on;
+u32  ps2_gs_display_width(void);
+u32  ps2_gs_display_height(void);
+static u64 display_reg(void);
+static u64 dispfb_reg(void);
+
+#define GS_VRAM_SIZE (4 * 1024 * 1024)
+
+enum {
+    GS_PRIM = 0x00, GS_RGBAQ = 0x01, GS_ST = 0x02, GS_UV = 0x03,
+    GS_XYZF2 = 0x04, GS_XYZ2 = 0x05, GS_TEX0_1 = 0x06, GS_TEX0_2 = 0x07,
+    GS_CLAMP_1 = 0x08, GS_CLAMP_2 = 0x09, GS_FOG = 0x0A,
+    GS_XYZF3 = 0x0C, GS_XYZ3 = 0x0D,
+    GS_TEX1_1 = 0x14, GS_TEX1_2 = 0x15, GS_TEX2_1 = 0x16, GS_TEX2_2 = 0x17,
+    GS_XYOFFSET_1 = 0x18, GS_XYOFFSET_2 = 0x19,
+    GS_PRMODECONT = 0x1A, GS_PRMODE = 0x1B, GS_TEXCLUT = 0x1C,
+    GS_SCANMSK = 0x22,
+    GS_MIPTBP1_1 = 0x34, GS_MIPTBP1_2 = 0x35,
+    GS_MIPTBP2_1 = 0x36, GS_MIPTBP2_2 = 0x37,
+    GS_TEXA = 0x3B, GS_FOGCOL = 0x3D, GS_TEXFLUSH = 0x3F,
+    GS_SCISSOR_1 = 0x40, GS_SCISSOR_2 = 0x41,
+    GS_ALPHA_1 = 0x42, GS_ALPHA_2 = 0x43,
+    GS_DIMX = 0x44, GS_DTHE = 0x45, GS_COLCLAMP = 0x46,
+    GS_TEST_1 = 0x47, GS_TEST_2 = 0x48, GS_PABE = 0x49,
+    GS_FBA_1 = 0x4A, GS_FBA_2 = 0x4B,
+    GS_FRAME_1 = 0x4C, GS_FRAME_2 = 0x4D,
+    GS_ZBUF_1 = 0x4E, GS_ZBUF_2 = 0x4F,
+    GS_BITBLTBUF = 0x50, GS_TRXPOS = 0x51, GS_TRXREG = 0x52,
+    GS_TRXDIR = 0x53, GS_HWREG = 0x54,
+    GS_SIGNAL = 0x60, GS_FINISH = 0x61, GS_LABEL = 0x62,
+};
+
+#define PRIM_POINT 0
+#define PRIM_LINE 1
+#define PRIM_LINESTRIP 2
+#define PRIM_TRI 3
+#define PRIM_TRISTRIP 4
+#define PRIM_TRIFAN 5
+#define PRIM_SPRITE 6
+#define PRIM_IIP (1u << 3)
+#define PRIM_TME (1u << 4)
+#define PRIM_ABE (1u << 6)
+#define PRIM_FST (1u << 8)
+#define PRIM_CTXT2 (1u << 9)
+
+typedef struct { s32 x, y; u32 z; u32 rgba; float s, t, q; u16 u, v;
+                 float fog; } gs_vtx;
+
+static u8 *gs_vram;
+static u64 gs_reg[0x64];
+static u64 gs_state_ver = 1;
+static u64 fs_memo_hits, fs_memo_misses;
+static u32 gs_prim;
+static u32 gs_rgba;
+static float gs_st_s, gs_st_t, gs_q = 1.0f;
+static u16 gs_u, gs_v;
+static float gs_fog = 1.0f;
+static gs_vtx gs_queue[3];
+static int gs_qn, gs_strip_parity;
+static u64 gs_stat_prims, gs_stat_pixels, gs_stat_regs;
+u64 ps2_gs_vtx_draw, ps2_gs_vtx_adc;
+static u64 gs_stat_trx, gs_stat_trxpix;
+static u64 gs_stat_deint;
+static u64 gs_stat_ws_hud, gs_stat_ws_cue;
+static int no_deinterlace;
+static u64 gs_reg_hist[0x64];
+
+static u32 trx_x, trx_y, trx_left;
+/* Set while a texture is decoded to raw CLUT indices (its palette lives in a
+   render target the GPU drew; gs.frag looks the colours up there). */
+static int tex_index_mode;
+static u8  trx24_buf[16];   /* PSMCT24 upload bytes awaiting a whole pixel */
+static u32 trx24_n;
+
+#define GS_PAGE_BYTES 8192u
+#define GS_VRAM_PAGES (GS_VRAM_SIZE / GS_PAGE_BYTES)
+static u32 gs_page_epoch[GS_VRAM_PAGES];
+static u32 gs_page_field[GS_VRAM_PAGES];   /* field of the page's last write */
+extern u32 ps2_gs_frame_count;
+static u32 gs_epoch_seq;
+static u64 gs_validation_seq = 1;
+
+static u32 gs_page_owner[GS_VRAM_PAGES];
+static u16 gs_page_owner_bw[GS_VRAM_PAGES];
+static u8  gs_page_owner_psm[GS_VRAM_PAGES];
+static u32 gs_dirty_owner;
+static u16 gs_dirty_owner_bw;
+static u8  gs_dirty_owner_psm;
+
+#define GS_SHADOW_MAX 1024
+static struct {
+    u32 owner;
+    u16 owner_bw;
+    u16 next;
+    u32 page;
+    u32 epoch;
+    u8 *data;
+} gs_shadow[GS_SHADOW_MAX];
+static u32 gs_shadow_n;
+static u16 gs_shadow_head[GS_VRAM_PAGES];
+static u64 gs_shadow_saves, gs_shadow_serves, gs_shadow_refresh;
+static u64 gs_shadow_differ, gs_shadow_same, gs_shadow_runs;
+static int gs_shadow_full;
+
+static void gs_shadow_save(u32 p) {
+    u32 old = gs_page_owner[p];
+    u16 obw = gs_page_owner_bw[p];
+    u32 i;
+    if (!old || old == gs_dirty_owner) return;
+    for (i = gs_shadow_head[p]; i; i = gs_shadow[i - 1u].next)
+        if (gs_shadow[i - 1u].owner == old) {
+            memcpy(gs_shadow[i - 1u].data, gs_vram + (size_t)p * GS_PAGE_BYTES,
+                   GS_PAGE_BYTES);
+            gs_shadow[i - 1u].epoch = gs_page_epoch[p];
+            gs_shadow_refresh++;
+            return;
+        }
+    if (gs_shadow_n >= GS_SHADOW_MAX) {
+        if (!gs_shadow_full) {
+            gs_shadow_full = 1;
+            ps2_log("gs: page shadows exhausted at %u -- buffers losing pages "
+                    "from here on will read whatever overwrote them",
+                    (unsigned)GS_SHADOW_MAX);
+        }
+        return;
+    }
+    {
+        u8 *d = (u8 *)malloc(GS_PAGE_BYTES);
+        u32 k;
+        if (!d) return;
+        memcpy(d, gs_vram + (size_t)p * GS_PAGE_BYTES, GS_PAGE_BYTES);
+        k = gs_shadow_n++;
+        gs_shadow[k].owner = old;
+        gs_shadow[k].owner_bw = obw;
+        gs_shadow[k].page = p;
+        gs_shadow[k].epoch = gs_page_epoch[p];
+        gs_shadow[k].data = d;
+        gs_shadow[k].next = gs_shadow_head[p];
+        gs_shadow_head[p] = (u16)(k + 1u);
+        gs_shadow_saves++;
+    }
+}
+
+static void gs_mark_dirty(u32 lo, u32 hi) {
+    u32 p, plo, phi;
+    if (hi > (u32)GS_VRAM_SIZE) hi = (u32)GS_VRAM_SIZE;
+    if (lo >= hi) return;
+    plo = lo / GS_PAGE_BYTES;
+    phi = (hi - 1u) / GS_PAGE_BYTES;
+    ++gs_epoch_seq;
+    ++gs_validation_seq;
+    for (p = plo; p <= phi && p < GS_VRAM_PAGES; p++) {
+        gs_shadow_save(p);
+        gs_page_epoch[p] = gs_epoch_seq;
+        gs_page_field[p] = ps2_gs_frame_count;
+        gs_page_owner[p] = gs_dirty_owner;
+        gs_page_owner_bw[p] = gs_dirty_owner_bw;
+        gs_page_owner_psm[p] = gs_dirty_owner_psm;
+    }
+}
+
+static int gs_owner_is_self(u32 owner, u16 obw, u32 tbp, u32 tbw, u32 thi) {
+    u32 ow = owner & ~1u;
+    return owner != 0u && ow >= tbp && ow < thi && obw == (u16)tbw;
+}
+
+static u32 gs_range_epoch(u32 lo, u32 hi) {
+    u32 p, plo, phi, m = 0;
+    if (hi > (u32)GS_VRAM_SIZE) hi = (u32)GS_VRAM_SIZE;
+    if (lo >= hi) return 0;
+    plo = lo / GS_PAGE_BYTES;
+    phi = (hi - 1u) / GS_PAGE_BYTES;
+    for (p = plo; p <= phi && p < GS_VRAM_PAGES; p++)
+        if (gs_page_epoch[p] > m) m = gs_page_epoch[p];
+    return m;
+}
+
+static int gs_shadow_off(void);
+
+static u32 gs_content_epoch(u32 tbp, u32 tbw, u32 lo, u32 hi) {
+    u32 p, plo, phi, m = 0, own = 0;
+    if (gs_shadow_off()) return gs_range_epoch(lo, hi);
+    if (hi > (u32)GS_VRAM_SIZE) hi = (u32)GS_VRAM_SIZE;
+    if (lo >= hi) return 0;
+    plo = lo / GS_PAGE_BYTES;
+    phi = (hi - 1u) / GS_PAGE_BYTES;
+    if (phi >= GS_VRAM_PAGES) phi = GS_VRAM_PAGES - 1u;
+    for (p = plo; p <= phi; p++)
+        if (gs_owner_is_self(gs_page_owner[p], gs_page_owner_bw[p],
+                             tbp, tbw, hi)) { own = 1; break; }
+    if (!own) return gs_range_epoch(lo, hi);
+    for (p = plo; p <= phi; p++) {
+        u32 e = gs_page_epoch[p];
+        if (!gs_owner_is_self(gs_page_owner[p], gs_page_owner_bw[p],
+                              tbp, tbw, hi)) {
+            u32 i;
+            for (i = gs_shadow_head[p]; i; i = gs_shadow[i - 1u].next)
+                if (gs_owner_is_self(gs_shadow[i - 1u].owner,
+                                     gs_shadow[i - 1u].owner_bw,
+                                     tbp, tbw, hi)) {
+                    e = gs_shadow[i - 1u].epoch;
+                    break;
+                }
+        }
+        if (e > m) m = e;
+    }
+    return m;
+}
+
+static const u8 *gs_pagebase[GS_VRAM_PAGES];
+
+#define GS_SHCENS_N 192
+static struct { u32 tbp, pages, own, foreign, redir; u64 n; }
+    gs_shcens[GS_SHCENS_N];
+static unsigned gs_shcens_n;
+
+static int gs_shadow_off(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PS2_TEX_NOSHADOW");
+        v = (e && *e && *e != '0') ? 1 : 0;
+        if (v) ps2_log("gs: page shadows disabled (PS2_TEX_NOSHADOW)");
+    }
+    return v;
+}
+
+static int gs_shadow_build(u32 tbp, u32 tbw, u32 lo, u32 hi) {
+    u32 p, plo, phi, own = 0, redir = 0;
+    if (gs_shadow_off()) return 0;
+    if (hi > (u32)GS_VRAM_SIZE) hi = (u32)GS_VRAM_SIZE;
+    if (lo >= hi) return 0;
+    plo = lo / GS_PAGE_BYTES;
+    phi = (hi - 1u) / GS_PAGE_BYTES;
+    if (phi >= GS_VRAM_PAGES) phi = GS_VRAM_PAGES - 1u;
+    for (p = plo; p <= phi; p++)
+        if (gs_owner_is_self(gs_page_owner[p], gs_page_owner_bw[p],
+                             tbp, tbw, hi)) { own = 1; break; }
+    if (!own) return 0;
+    for (p = plo; p <= phi; p++) {
+        const u8 *s = gs_vram;
+        if (!gs_owner_is_self(gs_page_owner[p], gs_page_owner_bw[p],
+                              tbp, tbw, hi)) {
+            u32 i;
+            for (i = gs_shadow_head[p]; i; i = gs_shadow[i - 1u].next)
+                if (gs_owner_is_self(gs_shadow[i - 1u].owner,
+                                     gs_shadow[i - 1u].owner_bw,
+                                     tbp, tbw, hi)) {
+                    s = gs_shadow[i - 1u].data;
+                    redir++;
+                    if (ps2_diag_armed) {
+                        if (memcmp(gs_shadow[i - 1u].data,
+                                   gs_vram + (size_t)p * GS_PAGE_BYTES,
+                                   GS_PAGE_BYTES) != 0) gs_shadow_differ++;
+                        else gs_shadow_same++;
+                    }
+                    break;
+                }
+        }
+        gs_pagebase[p] = s;
+    }
+    if (redir) gs_shadow_serves++;
+    {
+        u32 i, own_n = 0, foreign = 0;
+        for (p = plo; p <= phi; p++)
+            if (gs_owner_is_self(gs_page_owner[p], gs_page_owner_bw[p],
+                                 tbp, tbw, hi)) own_n++;
+            else foreign++;
+        for (i = 0; i < gs_shcens_n; i++) if (gs_shcens[i].tbp == tbp) break;
+        if (i == gs_shcens_n && gs_shcens_n < GS_SHCENS_N) gs_shcens_n++;
+        if (i < GS_SHCENS_N) {
+            gs_shcens[i].tbp = tbp;
+            gs_shcens[i].pages = phi - plo + 1u;
+            gs_shcens[i].own = own_n;
+            gs_shcens[i].foreign = foreign;
+            gs_shcens[i].redir = redir;
+            gs_shcens[i].n++;
+        }
+    }
+    return redir != 0;
+}
+
+void ps2_gs_shadow_report(void) {
+    u64 held = (u64)gs_shadow_n * GS_PAGE_BYTES;
+    if (!gs_shadow_saves && !gs_shadow_serves) return;
+    ps2_log("GS page shadows: %u pages held (%llu KB), %llu saved, %llu "
+            "refreshed, %llu decodes served from one%s",
+            gs_shadow_n, (unsigned long long)(held / 1024u),
+            (unsigned long long)gs_shadow_saves,
+            (unsigned long long)gs_shadow_refresh,
+            (unsigned long long)gs_shadow_serves,
+            gs_shadow_full ? "  (POOL EXHAUSTED)" : "");
+    ps2_log("GS page shadows: %llu redirected pages differ from local memory, "
+            "%llu are identical, %llu block runs read through one", (unsigned long long)gs_shadow_differ,
+            (unsigned long long)gs_shadow_same, (unsigned long long)gs_shadow_runs);
+    {
+        unsigned i, j;
+        for (i = 0; i < gs_shcens_n; i++) {
+            unsigned best = i;
+            for (j = i + 1; j < gs_shcens_n; j++)
+                if (gs_shcens[j].foreign > gs_shcens[best].foreign) best = j;
+            if (best != i) {
+                typeof(gs_shcens[0]) t = gs_shcens[i];
+                gs_shcens[i] = gs_shcens[best];
+                gs_shcens[best] = t;
+            }
+            if (!gs_shcens[i].foreign) break;
+            ps2_log("  tex tbp=%-8u %3u pages: own %3u  taken %3u  of which "
+                    "%3u recovered from a shadow   (%llu decodes)",
+                    gs_shcens[i].tbp, gs_shcens[i].pages, gs_shcens[i].own,
+                    gs_shcens[i].foreign, gs_shcens[i].redir,
+                    (unsigned long long)gs_shcens[i].n);
+        }
+    }
+}
+
+static u64 gs_vram_epoch;
+
+u32 ps2_gs_frame_count;
+
+void ps2_gs_init(void) {
+    gs_vram = (u8 *)calloc(1, GS_VRAM_SIZE);
+    if (!gs_vram) ps2_fatal("cannot allocate GS VRAM");
+    gs_reg[GS_PRMODECONT] = 1;
+}
+
+#define PSM_CT32   0
+#define PSM_CT24   1
+#define PSM_CT16   2
+#define PSM_CT16S  10
+#define PSM_T8     19
+#define PSM_T4     20
+#define PSM_T8H    27
+#define PSM_T4HL   36
+#define PSM_T4HH   44
+#define PSM_Z32    48
+#define PSM_Z24    49
+#define PSM_Z16    50
+#define PSM_Z16S   51
+
+static u32 psm_bits(u32 psm) {
+    switch (psm) {
+    case PSM_CT16: case PSM_CT16S: case PSM_Z16: case PSM_Z16S: return 16;
+    case PSM_T8:  return 8;
+    case PSM_T4:  return 4;
+    default:      return 32;
+    }
+}
+
+static const u8 blk_ct32[4][8] = {
+    {  0,  1,  4,  5, 16, 17, 20, 21 },
+    {  2,  3,  6,  7, 18, 19, 22, 23 },
+    {  8,  9, 12, 13, 24, 25, 28, 29 },
+    { 10, 11, 14, 15, 26, 27, 30, 31 }
+};
+static const u8 blk_z32[4][8] = {
+    { 24, 25, 28, 29,  8,  9, 12, 13 },
+    { 26, 27, 30, 31, 10, 11, 14, 15 },
+    { 16, 17, 20, 21,  0,  1,  4,  5 },
+    { 18, 19, 22, 23,  2,  3,  6,  7 }
+};
+static const u8 blk_ct16[8][4] = {
+    {  0,  2,  8, 10 }, {  1,  3,  9, 11 }, {  4,  6, 12, 14 }, {  5,  7, 13, 15 },
+    { 16, 18, 24, 26 }, { 17, 19, 25, 27 }, { 20, 22, 28, 30 }, { 21, 23, 29, 31 }
+};
+static const u8 blk_ct16s[8][4] = {
+    {  0,  2, 16, 18 }, {  1,  3, 17, 19 }, {  8, 10, 24, 26 }, {  9, 11, 25, 27 },
+    {  4,  6, 20, 22 }, {  5,  7, 21, 23 }, { 12, 14, 28, 30 }, { 13, 15, 29, 31 }
+};
+static const u8 blk_z16[8][4] = {
+    { 24, 26, 16, 18 }, { 25, 27, 17, 19 }, { 28, 30, 20, 22 }, { 29, 31, 21, 23 },
+    {  8, 10,  0,  2 }, {  9, 11,  1,  3 }, { 12, 14,  4,  6 }, { 13, 15,  5,  7 }
+};
+static const u8 blk_z16s[8][4] = {
+    { 24, 26,  8, 10 }, { 25, 27,  9, 11 }, { 16, 18,  0,  2 }, { 17, 19,  1,  3 },
+    { 28, 30, 12, 14 }, { 29, 31, 13, 15 }, { 20, 22,  4,  6 }, { 21, 23,  5,  7 }
+};
+
+#define GS_SW32 0u
+#define GS_SW16 1u
+#define GS_SW8  2u
+#define GS_SW4  3u
+
+static u16 gs_swz[4][512];
+static int gs_swz_ready;
+
+static u32 gs_swz_bit(u32 cls, u32 x, u32 y) {
+    u32 colh = (cls == GS_SW8 || cls == GS_SW4) ? 4u : 2u;
+    u32 colnum = y / colh, cy = y % colh;
+    u32 w = (x & 1u) | (((x >> 1) & 3u) << 2) | ((cy & 1u) << 1);
+    u32 sub = 0, bits;
+    if (colh == 4u && (((cy >> 1) & 1u) ^ (colnum & 1u))) w ^= 8u;
+    switch (cls) {
+    case GS_SW16: bits = 16u; sub = (x >> 3) & 1u; break;
+    case GS_SW8:  bits = 8u;  sub = ((cy >> 1) & 1u) | (((x >> 3) & 1u) << 1); break;
+    case GS_SW4:  bits = 4u;  sub = (((x >> 3) & 3u) << 1) | ((cy >> 1) & 1u); break;
+    default:      bits = 32u; sub = 0; break;
+    }
+    return colnum * 512u + w * 32u + sub * bits;
+}
+
+static void gs_swz_init(void) {
+    static const u32 bw[4] = { 8, 16, 16, 32 };
+    static const u32 bh[4] = { 8,  8, 16, 16 };
+    static const u32 bits[4] = { 32, 16, 8, 4 };
+    const char *e = getenv("PS2_GS_LINEAR_BLOCK");
+    int linear = e && *e && *e != '0';
+    u32 c, x, y;
+    for (c = 0; c < 4; c++)
+        for (y = 0; y < bh[c]; y++)
+            for (x = 0; x < bw[c]; x++)
+                gs_swz[c][y * bw[c] + x] =
+                    (u16)(linear ? (y * bw[c] + x) * bits[c]
+                                 : gs_swz_bit(c, x, y));
+    if (linear)
+        ps2_log("gs: PS2_GS_LINEAR_BLOCK -- blocks filled linearly, "
+                "the pre-swizzle model");
+    gs_swz_ready = 1;
+}
+
+typedef struct {
+    u32 pw, ph;
+    u32 bw, bh;
+    u32 bits;
+    const u8 *tab;
+    u32 tabcols;
+    u32 pwsh, phsh, bwsh, bhsh;
+    u32 pwmask, phmask, bwmask, bhmask;
+    const u16 *off;
+} gs_geom;
+
+static u32 gs_log2(u32 v) {
+    u32 n = 0;
+    while ((1u << n) < v && n < 31u) n++;
+    return n;
+}
+
+static void gs_psm_geom_build(u32 psm, gs_geom *g);
+static gs_geom gs_geom_tab[64];
+static int gs_geom_tab_ready;
+
+static void gs_psm_geom(u32 psm, gs_geom *g) {
+    if (PS2_UNLIKELY(!gs_geom_tab_ready)) {
+        for (u32 i = 0; i < 64u; i++) gs_psm_geom_build(i, &gs_geom_tab[i]);
+        gs_geom_tab_ready = 1;
+    }
+    *g = gs_geom_tab[psm & 63u];
+}
+
+static void gs_psm_geom_build(u32 psm, gs_geom *g) {
+    g->bits = psm_bits(psm);
+    switch (psm) {
+    case PSM_T4:
+        g->pw = 128; g->ph = 128; g->bw = 32; g->bh = 16;
+        g->tab = &blk_ct16[0][0]; g->tabcols = 4;
+        break;
+    case PSM_T8:
+        g->pw = 128; g->ph = 64; g->bw = 16; g->bh = 16;
+        g->tab = &blk_ct32[0][0]; g->tabcols = 8;
+        break;
+    case PSM_CT16:
+        g->pw = 64; g->ph = 64; g->bw = 16; g->bh = 8;
+        g->tab = &blk_ct16[0][0]; g->tabcols = 4;
+        break;
+    case PSM_CT16S:
+        g->pw = 64; g->ph = 64; g->bw = 16; g->bh = 8;
+        g->tab = &blk_ct16s[0][0]; g->tabcols = 4;
+        break;
+    case PSM_Z16:
+        g->pw = 64; g->ph = 64; g->bw = 16; g->bh = 8;
+        g->tab = &blk_z16[0][0]; g->tabcols = 4;
+        break;
+    case PSM_Z16S:
+        g->pw = 64; g->ph = 64; g->bw = 16; g->bh = 8;
+        g->tab = &blk_z16s[0][0]; g->tabcols = 4;
+        break;
+    case PSM_Z32: case PSM_Z24:
+        g->pw = 64; g->ph = 32; g->bw = 8; g->bh = 8;
+        g->tab = &blk_z32[0][0]; g->tabcols = 8;
+        break;
+    default:
+        g->pw = 64; g->ph = 32; g->bw = 8; g->bh = 8;
+        g->tab = &blk_ct32[0][0]; g->tabcols = 8;
+        break;
+    }
+    if (!gs_swz_ready) gs_swz_init();
+    g->off = gs_swz[g->bits == 4u  ? GS_SW4
+                  : g->bits == 8u  ? GS_SW8
+                  : g->bits == 16u ? GS_SW16 : GS_SW32];
+
+    g->pwsh = gs_log2(g->pw); g->pwmask = g->pw - 1u;
+    g->phsh = gs_log2(g->ph); g->phmask = g->ph - 1u;
+    g->bwsh = gs_log2(g->bw); g->bwmask = g->bw - 1u;
+    g->bhsh = gs_log2(g->bh); g->bhmask = g->bh - 1u;
+}
+
+static inline u64 vram_bit_g(const gs_geom *g, u32 base, u32 ppr, u32 x, u32 y) {
+    u32 page = (y >> g->phsh) * ppr + (x >> g->pwsh);
+    u32 block = g->tab[((y & g->phmask) >> g->bhsh) * g->tabcols
+                       + ((x & g->pwmask) >> g->bwsh)];
+    u32 inblk = g->off[((y & g->bhmask) << g->bwsh) + (x & g->bwmask)];
+    return (u64)base * 8u + (u64)page * 65536u + (u64)block * 2048u
+         + (u64)inblk;
+}
+
+static u32 gs_page_span(const gs_geom *g, u32 bufw, u32 x1, u32 y1) {
+    u32 ppr = bufw / g->pw;
+    if (!ppr) ppr = 1;
+    return (y1 / g->ph) * ppr + (x1 / g->pw) + 1u;
+}
+
+static u64 vram_bit(u32 base, u32 bufw, u32 x, u32 y, u32 psm) {
+    gs_geom g;
+    u32 ppr;
+    gs_psm_geom(psm, &g);
+    ppr = bufw / g.pw;
+    if (!ppr) ppr = 1;
+    return vram_bit_g(&g, base, ppr, x, y);
+}
+
+static u32 vram_get(u32 base, u32 bw, u32 x, u32 y, u32 psm) {
+    u64 bit = vram_bit(base, bw, x, y, psm);
+    u32 off = (u32)(bit >> 3), w;
+    switch (psm_bits(psm)) {
+    case 4:
+        if (off >= GS_VRAM_SIZE) return 0;
+        return (bit & 4u) ? (gs_vram[off] >> 4) : (gs_vram[off] & 0xFu);
+    case 8:
+        return off < GS_VRAM_SIZE ? gs_vram[off] : 0u;
+    case 16:
+        if (off + 2 > GS_VRAM_SIZE) return 0;
+        return (u32)gs_vram[off] | ((u32)gs_vram[off + 1] << 8);
+    default:
+        if (off + 4 > GS_VRAM_SIZE) return 0;
+        memcpy(&w, gs_vram + off, 4);
+        if (psm == PSM_T8H)  return (w >> 24) & 0xFFu;
+        if (psm == PSM_T4HL) return (w >> 24) & 0x0Fu;
+        if (psm == PSM_T4HH) return (w >> 28) & 0x0Fu;
+        return w;
+    }
+}
+
+static u32 vram_watch;
+static int vram_watch_ready;
+static void vram_watch_init(void) {
+    const char *e = getenv("PS2_WATCH_VRAM");
+    vram_watch = e ? (u32)strtoul(e, NULL, 0) : 0xFFFFFFFFu;
+    vram_watch_ready = 1;
+}
+
+static void vram_store_b(u32 off, u64 bit, u32 psm, u32 bits, u32 v);
+static void vram_store(u32 off, u64 bit, u32 psm, u32 v) {
+    vram_store_b(off, bit, psm, psm_bits(psm), v);
+}
+static void vram_store_b(u32 off, u64 bit, u32 psm, u32 bits, u32 v) {
+    u32 w;
+    switch (bits) {
+    case 4:
+        if (off >= GS_VRAM_SIZE) return;
+        if (bit & 4u) gs_vram[off] = (u8)((gs_vram[off] & 0x0Fu) | ((v & 0xFu) << 4));
+        else          gs_vram[off] = (u8)((gs_vram[off] & 0xF0u) | (v & 0xFu));
+        return;
+    case 8:
+        if (off < GS_VRAM_SIZE) gs_vram[off] = (u8)v;
+        return;
+    case 16:
+        if (off + 2 > GS_VRAM_SIZE) return;
+        gs_vram[off] = (u8)v;
+        gs_vram[off + 1] = (u8)(v >> 8);
+        return;
+    default:
+        if (off + 4 > GS_VRAM_SIZE) return;
+        if (psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH) {
+            memcpy(&w, gs_vram + off, 4);
+            if (psm == PSM_T8H)  w = (w & 0x00FFFFFFu) | ((v & 0xFFu) << 24);
+            if (psm == PSM_T4HL) w = (w & 0xF0FFFFFFu) | ((v & 0x0Fu) << 24);
+            if (psm == PSM_T4HH) w = (w & 0x0FFFFFFFu) | ((v & 0x0Fu) << 28);
+            memcpy(gs_vram + off, &w, 4);
+            return;
+        }
+        if (psm == PSM_CT24 || psm == PSM_Z24) {
+            memcpy(&w, gs_vram + off, 4);
+            w = (w & 0xFF000000u) | (v & 0x00FFFFFFu);
+            memcpy(gs_vram + off, &w, 4);
+            return;
+        }
+        memcpy(gs_vram + off, &v, 4);
+        return;
+    }
+}
+
+static void vram_put(u32 base, u32 bw, u32 x, u32 y, u32 psm, u32 v) {
+    u64 bit = vram_bit(base, bw, x, y, psm);
+    u32 off = (u32)(bit >> 3);
+    if (!vram_watch_ready) vram_watch_init();
+    if (off == vram_watch)
+        ps2_log("watch: frame %llu  write %08X psm=%u via base=%u bw=%u (%u,%u)",
+                (unsigned long long)ps2_gs_frame_count, v, psm, base, bw, x, y);
+    vram_store(off, bit, psm, v);
+}
+
+static u32 ctx_of(void) { return (gs_prim & PRIM_CTXT2) ? 1u : 0u; }
+
+static u64 frame_reg(void) { return gs_reg[ctx_of() ? GS_FRAME_2 : GS_FRAME_1]; }
+static u64 zbuf_reg(void) { return gs_reg[ctx_of() ? GS_ZBUF_2 : GS_ZBUF_1]; }
+static u64 test_reg(void) { return gs_reg[ctx_of() ? GS_TEST_2 : GS_TEST_1]; }
+static u64 scissor_reg(void) { return gs_reg[ctx_of() ? GS_SCISSOR_2 : GS_SCISSOR_1]; }
+static u64 xyoff_reg(void) { return gs_reg[ctx_of() ? GS_XYOFFSET_2 : GS_XYOFFSET_1]; }
+static u64 tex0_reg(void) { return gs_reg[ctx_of() ? GS_TEX0_2 : GS_TEX0_1]; }
+static u64 alpha_reg(void) { return gs_reg[ctx_of() ? GS_ALPHA_2 : GS_ALPHA_1]; }
+static u64 clamp_reg(void) { return gs_reg[ctx_of() ? GS_CLAMP_2 : GS_CLAMP_1]; }
+static u64 tex1_reg(void) { return gs_reg[ctx_of() ? GS_TEX1_2 : GS_TEX1_1]; }
+static u64 miptbp1_reg(void) { return gs_reg[ctx_of() ? GS_MIPTBP1_2 : GS_MIPTBP1_1]; }
+static u64 miptbp2_reg(void) { return gs_reg[ctx_of() ? GS_MIPTBP2_2 : GS_MIPTBP2_1]; }
+
+static u32 fb_base(void) { return (u32)(frame_reg() & 0x1FFull) * 2048u * 4u; }
+static u32 fb_width(void) { return (u32)((frame_reg() >> 16) & 0x3Full) * 64u; }
+static u32 fb_psm(void) { return (u32)((frame_reg() >> 24) & 0x3Full); }
+static u32 fb_mask(void) { return (u32)(frame_reg() >> 32); }
+static u32 zb_base(void) { return (u32)(zbuf_reg() & 0x1FFull) * 2048u * 4u; }
+static u32 zb_enabled(void) { return ((zbuf_reg() >> 32) & 1ull) == 0ull; }
+
+/* The mip level of the primitive being drawn when TEX1.LCM is 0 -- the GS
+   then works LOD out per pixel from Q: (log2(1/|Q|) << L) + K.  Here it is
+   taken once per primitive from its vertices (a level the texture cache can
+   decode), or -1 when the primitive does not mipmap that way.  AC4's terrain
+   keeps distant tiles only in the small levels of its texture cache; read
+   from level 0 they showed the near tile that shares the slot -- big wrong
+   squares on islands in the distance. */
+static int gs_dyn_lod = -1;
+
+static void gs_prim_lod(const gs_vtx *a, const gs_vtx *b, const gs_vtx *c) {
+    u64 t1 = tex1_reg();
+    u32 mxl = (u32)((t1 >> 2) & 7ull), mmin = (u32)((t1 >> 6) & 7ull), n = 0;
+    float sum = 0.0f, lod;
+    s32 k;
+    const gs_vtx *vv[3] = { a, b, c };
+    static int off = -1;
+    gs_dyn_lod = -1;
+    if (off < 0) {
+        const char *e = getenv("PS2_NO_DYN_MIP");
+        off = (e && *e && *e != '0') ? 1 : 0;
+        if (off) ps2_log("GS: per-primitive mip levels off (PS2_NO_DYN_MIP)");
+    }
+    if (off || !(gs_prim & PRIM_TME) || (t1 & 1ull) || !mxl || mmin < 2u) return;
+    k = (s32)((t1 >> 32) & 0xFFFull);
+    if (k & 0x800) k -= 0x1000;
+    for (u32 i = 0; i < 3u; i++) {
+        float q;
+        if (!vv[i]) continue;
+        q = fabsf(vv[i]->q);
+        if (!(q > 1e-30f)) q = 1e-30f;
+        sum += -log2f(q) * (float)(1u << ((t1 >> 19) & 3ull)) + (float)k / 16.0f;
+        n++;
+    }
+    if (!n) return;
+    lod = sum / (float)n;
+    gs_dyn_lod = lod <= 0.0f ? 0 : (int)(lod + 0.5f);
+    if (gs_dyn_lod > (int)mxl) gs_dyn_lod = (int)mxl;
+}
+
+/* Triangles get the GS's own per-pixel choice.  Q is affine in screen space,
+   so a triangle's LOD runs between its vertices' values; it is drawn once for
+   each level that range touches, and gs.frag works LOD out for every pixel,
+   keeps the pixels that belong to the level of that draw and, for MMIN 3/5,
+   blends in the next level (AC4's terrain asks for trilinear).  Every pixel is
+   still written once, with the triangle's own depth.  gs_dyn_mip is the
+   ps2_vk_state.mip word for the draw being made; 0 = not per pixel. */
+static u32 gs_dyn_mip;
+
+static int gs_tri_mip_range(const gs_vtx *a, const gs_vtx *b, const gs_vtx *c,
+                            int *lo, int *hi) {
+    u64 t1 = tex1_reg();
+    u32 mxl = (u32)((t1 >> 2) & 7ull), mmin = (u32)((t1 >> 6) & 7ull);
+    u32 l = (u32)((t1 >> 19) & 3ull);
+    s32 k = (s32)((t1 >> 32) & 0xFFFull);
+    int blend, last;
+    float mn = 1e30f, mx = -1e30f, bias;
+    const gs_vtx *vv[3] = { a, b, c };
+    static int off = -1, no_blend, said;
+    if (off < 0) {
+        const char *e = getenv("PS2_NO_PIXEL_MIP");
+        off = ((e && *e && *e != '0') || getenv("PS2_NO_DYN_MIP")) ? 1 : 0;
+        if (off) ps2_log("GS: mip levels are not chosen per pixel (PS2_NO_PIXEL_MIP)");
+        e = getenv("PS2_NO_MIP_BLEND");
+        no_blend = (e && *e && *e != '0') ? 1 : 0;
+        if (no_blend) ps2_log("GS: no blending between mip levels, the nearest is "
+                              "used (PS2_NO_MIP_BLEND)");
+    }
+    gs_dyn_mip = 0;
+    if (off || !(gs_prim & PRIM_TME) || (gs_prim & PRIM_FST) || (t1 & 1ull)
+        || !mxl || mmin < 2u)
+        return 0;
+    blend = !no_blend && (mmin == 3u || mmin == 5u);
+    last = blend ? (int)mxl - 1 : (int)mxl;
+    bias = blend ? 0.0f : 0.5f;
+    if (!said) {
+        said = 1;
+        ps2_log("GS: mip level chosen per pixel%s (first: TEX1 %016llX)",
+                blend ? ", blended between levels" : "", (unsigned long long)t1);
+    }
+    if (k & 0x800) k -= 0x1000;
+    for (u32 i = 0; i < 3u; i++) {
+        float q = vv[i]->q, lod;
+        if (!(fabsf(q) > 1e-30f) || (q < 0.0f) != (a->q < 0.0f)) return 0;
+        lod = -log2f(fabsf(q)) * (float)(1u << l) + (float)k / 16.0f;
+        if (lod < mn) mn = lod;
+        if (lod > mx) mx = lod;
+    }
+    /* with slack, so the GPU's LOD never lands on a level with no draw */
+    *lo = (int)floorf(mn + bias - 1.0f / 64.0f);
+    *hi = (int)floorf(mx + bias + 1.0f / 64.0f);
+    if (*lo < 0) *lo = 0;
+    if (*lo > last) *lo = last;
+    if (*hi < *lo) *hi = *lo;
+    if (*hi > last) *hi = last;
+    gs_dyn_mip = ((u32)k & 0xFFFu) | (l << 12) | (mxl << 17) | (1u << 20)
+               | (blend ? 1u << 21 : 1u << 22);
+    return 1;
+}
+
+static u32 gs_tex_lod(void) {
+    u64 t1 = tex1_reg();
+    u32 mxl  = (u32)((t1 >> 2) & 7ull);
+    u32 mmin = (u32)((t1 >> 6) & 7ull);
+    s32 k;
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("PS2_NO_MIP");
+        off = (e && *e && *e != '0') ? 1 : 0;
+        if (off) ps2_log("GS: mipmap level selection disabled (PS2_NO_MIP)");
+    }
+    if (off) return 0u;
+    if (!mxl || mmin < 2u) return 0u;
+    if (!(t1 & 1ull)) return gs_dyn_lod > 0 ? (u32)gs_dyn_lod : 0u;
+    k = (s32)((t1 >> 32) & 0xFFFull);
+    if (k & 0x800) k -= 0x1000;
+    if (k < 0) return 0u;
+    k = (k + 8) >> 4;
+    return (u32)k > mxl ? mxl : (u32)k;
+}
+
+static void gs_mip_level(u32 lod, u32 psm, u32 *tbp, u32 *tbw,
+                         u32 *w, u32 *h) {
+    u32 bits = psm_bits(psm), i;
+    if (!lod) return;
+    if ((tex1_reg() >> 9) & 1ull) {
+        for (i = 0; i < lod; i++) {
+            *tbp += *w * *h * bits / 8u;
+            *tbw = *tbw > 64u ? *tbw >> 1 : 64u;
+            *w = *w > 1u ? *w >> 1 : 1u;
+            *h = *h > 1u ? *h >> 1 : 1u;
+        }
+        return;
+    }
+    {
+        u64 m = lod <= 3u ? miptbp1_reg() : miptbp2_reg();
+        u32 s = ((lod - 1u) % 3u) * 20u;
+        *tbp = (u32)((m >> s) & 0x3FFFull) * 256u;
+        *tbw = (u32)((m >> (s + 14u)) & 0x3Full) * 64u;
+        for (i = 0; i < lod; i++) {
+            *w = *w > 1u ? *w >> 1 : 1u;
+            *h = *h > 1u ? *h >> 1 : 1u;
+        }
+    }
+}
+
+static void put_pixel(u32 x, u32 y, u32 rgba) {
+    u32 w = fb_width(), psm = fb_psm();
+    if (!w || !gs_vram) return;
+    if (psm == PSM_CT32 || psm == PSM_CT24) {
+        u32 msk = fb_mask();
+        u32 old = vram_get(fb_base(), w, x, y, psm);
+        rgba = (old & msk) | (rgba & ~msk);
+    }
+    vram_put(fb_base(), w, x, y, psm, rgba);
+    gs_stat_pixels++;
+}
+
+static int z_test_and_write(u32 x, u32 y, u32 z) {
+    u32 w = fb_width(), old;
+    u32 zfmt = (u32)((zbuf_reg() >> 24) & 0xFull);
+    u32 zpsm = zfmt == 10 ? PSM_Z16S : zfmt + PSM_Z32;
+    u32 ztst = (u32)((test_reg() >> 17) & 3ull);
+    if (!zb_enabled() || !w || !gs_vram) return 1;
+    old = vram_get(zb_base(), w, x, y, zpsm);
+    switch (ztst) {
+    case 0: return 0;
+    case 1: break;
+    case 2: if (!(z >= old)) return 0; break;
+    case 3: if (!(z > old)) return 0; break;
+    }
+    vram_put(zb_base(), w, x, y, zpsm, z);
+    return 1;
+}
+
+static u32 sample_texture(float s, float t, float q) {
+    u64 t0 = tex0_reg();
+    u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
+    u32 tbw = (u32)((t0 >> 14) & 0x3Full) * 64u;
+    u32 psm = (u32)((t0 >> 20) & 0x3Full);
+    u32 tw = 1u << ((t0 >> 26) & 0xFull);
+    u32 th = 1u << ((t0 >> 30) & 0xFull);
+    u32 x, y, off, texel;
+    if (!tbw) tbw = tw;
+    if (gs_prim & PRIM_FST) { x = gs_u >> 4; y = gs_v >> 4; }
+    else {
+        float iq = q != 0.0f ? 1.0f / q : 0.0f;
+        x = (u32)(s * iq * (float)tw);
+        y = (u32)(t * iq * (float)th);
+    }
+    x %= tw ? tw : 1u;
+    y %= th ? th : 1u;
+    (void)off;
+    texel = vram_get(tbp, tbw, x, y, psm);
+    return texel;
+}
+
+static u32 blend(u32 src, u32 dst) {
+    u64 a = alpha_reg();
+    u32 A = (u32)(a & 3ull), B = (u32)((a >> 2) & 3ull);
+    u32 C = (u32)((a >> 4) & 3ull), D = (u32)((a >> 6) & 3ull);
+    u32 fix = (u32)((a >> 32) & 0xFFull);
+    u32 out = 0;
+    for (int i = 0; i < 3; i++) {
+        s32 ca = (s32)((src >> (i * 8)) & 0xFF);
+        s32 cb = (s32)((dst >> (i * 8)) & 0xFF);
+        s32 va = A == 0 ? ca : (A == 1 ? cb : 0);
+        s32 vb = B == 0 ? ca : (B == 1 ? cb : 0);
+        s32 vd = D == 0 ? ca : (D == 1 ? cb : 0);
+        s32 vc = C == 0 ? (s32)((src >> 24) & 0xFF)
+                        : (C == 1 ? (s32)((dst >> 24) & 0xFF) : (s32)fix);
+        s32 r = (((va - vb) * vc) >> 7) + vd;
+        if (r < 0) r = 0;
+        if (r > 255) r = 255;
+        out |= (u32)r << (i * 8);
+    }
+    return out | (src & 0xFF000000u);
+}
+
+static void shade_pixel(s32 x, s32 y, u32 z, u32 rgba, float s, float t, float q) {
+    u64 sc = scissor_reg();
+    u32 x0 = (u32)(sc & 0x7FFull), x1 = (u32)((sc >> 16) & 0x7FFull);
+    u32 y0 = (u32)((sc >> 32) & 0x7FFull), y1 = (u32)((sc >> 48) & 0x7FFull);
+    u32 col = rgba;
+    if (x < (s32)x0 || x > (s32)x1 || y < (s32)y0 || y > (s32)y1) return;
+    if (x < 0 || y < 0) return;
+    if (gs_prim & PRIM_TME) {
+        u32 tex = sample_texture(s, t, q);
+        u32 o = 0;
+        for (int i = 0; i < 4; i++) {
+            u32 ct = (tex >> (i * 8)) & 0xFF;
+            u32 cf = (col >> (i * 8)) & 0xFF;
+            u32 v = (ct * cf) >> 7;
+            if (v > 255) v = 255;
+            o |= v << (i * 8);
+        }
+        col = o;
+    }
+    if (!z_test_and_write((u32)x, (u32)y, z)) return;
+    if (gs_prim & PRIM_ABE) {
+        u32 dst = vram_get(fb_base(), fb_width(), (u32)x, (u32)y,
+                           (u32)((frame_reg() >> 24) & 0x3F));
+        col = blend(col, dst);
+    }
+    put_pixel((u32)x, (u32)y, col);
+}
+
+static void draw_sprite(const gs_vtx *a, const gs_vtx *b) {
+    s32 x0 = a->x >> 4, y0 = a->y >> 4, x1 = b->x >> 4, y1 = b->y >> 4;
+    s32 t, x, y;
+    if (x0 > x1) { t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { t = y0; y0 = y1; y1 = t; }
+    if (x1 - x0 > 4096 || y1 - y0 > 4096) return;
+    for (y = y0; y < y1; y++)
+        for (x = x0; x < x1; x++) {
+            float fs = 0.0f, ft = 0.0f;
+            if (x1 > x0 && y1 > y0) {
+                fs = a->s + (b->s - a->s) * (float)(x - x0) / (float)(x1 - x0);
+                ft = a->t + (b->t - a->t) * (float)(y - y0) / (float)(y1 - y0);
+            }
+            shade_pixel(x, y, b->z, b->rgba, fs, ft, b->q);
+        }
+    gs_stat_prims++;
+}
+
+static void draw_triangle(const gs_vtx *v0, const gs_vtx *v1, const gs_vtx *v2) {
+    s32 minx, maxx, miny, maxy, x, y;
+    float ax = (float)v0->x / 16.0f, ay = (float)v0->y / 16.0f;
+    float bx = (float)v1->x / 16.0f, by = (float)v1->y / 16.0f;
+    float cx = (float)v2->x / 16.0f, cy = (float)v2->y / 16.0f;
+    float area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (area == 0.0f) return;
+    minx = (s32)((v0->x < v1->x ? (v0->x < v2->x ? v0->x : v2->x)
+                                : (v1->x < v2->x ? v1->x : v2->x)) >> 4);
+    maxx = (s32)((v0->x > v1->x ? (v0->x > v2->x ? v0->x : v2->x)
+                                : (v1->x > v2->x ? v1->x : v2->x)) >> 4);
+    miny = (s32)((v0->y < v1->y ? (v0->y < v2->y ? v0->y : v2->y)
+                                : (v1->y < v2->y ? v1->y : v2->y)) >> 4);
+    maxy = (s32)((v0->y > v1->y ? (v0->y > v2->y ? v0->y : v2->y)
+                                : (v1->y > v2->y ? v1->y : v2->y)) >> 4);
+    if (maxx - minx > 4096 || maxy - miny > 4096) return;
+    for (y = miny; y <= maxy; y++) {
+        for (x = minx; x <= maxx; x++) {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float w0 = ((bx - ax) * (py - ay) - (by - ay) * (px - ax)) / area;
+            float w1 = ((cx - bx) * (py - by) - (cy - by) * (px - bx)) / area;
+            float w2 = 1.0f - w0 - w1;
+            float l0, l1, l2;
+            u32 col, z;
+            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+            l0 = w1; l1 = w2; l2 = w0;
+            z = (u32)(l0 * (float)v0->z + l1 * (float)v1->z + l2 * (float)v2->z);
+            if (gs_prim & PRIM_IIP) {
+                u32 o = 0;
+                for (int i = 0; i < 4; i++) {
+                    float c = l0 * (float)((v0->rgba >> (i * 8)) & 0xFF)
+                            + l1 * (float)((v1->rgba >> (i * 8)) & 0xFF)
+                            + l2 * (float)((v2->rgba >> (i * 8)) & 0xFF);
+                    u32 ci = (u32)(c < 0.0f ? 0.0f : (c > 255.0f ? 255.0f : c));
+                    o |= ci << (i * 8);
+                }
+                col = o;
+            } else {
+                col = v2->rgba;
+            }
+            shade_pixel(x, y, z,  col,
+                        l0 * v0->s + l1 * v1->s + l2 * v2->s,
+                        l0 * v0->t + l1 * v1->t + l2 * v2->t,
+                        l0 * v0->q + l1 * v1->q + l2 * v2->q);
+        }
+    }
+    gs_stat_prims++;
+}
+
+static void vk_assemble(const gs_vtx *v);
+
+static void vertex_push(gs_vtx v, int draw);
+
+static void vertex_kick(s32 x, s32 y, u32 z, int draw) {
+    u64 off = xyoff_reg();
+    gs_vtx v;
+    v.x = x - (s32)(off & 0xFFFFull);
+    v.y = y - (s32)((off >> 32) & 0xFFFFull);
+    v.z = z;
+    vertex_push(v, draw);
+}
+
+static float z_norm(u32 z);
+
+static void vertex_push(gs_vtx v, int draw) {
+    if (draw) ps2_gs_vtx_draw++; else ps2_gs_vtx_adc++;
+    v.rgba = gs_rgba;
+    v.s = gs_st_s; v.t = gs_st_t; v.q = gs_q;
+    v.u = gs_u; v.v = gs_v;
+    v.fog = gs_fog;
+
+    if (gs_qn < 3) gs_queue[gs_qn++] = v;
+    else { gs_queue[0] = gs_queue[1]; gs_queue[1] = gs_queue[2]; gs_queue[2] = v; }
+    if (!draw) return;
+
+    if (ps2_vk_enabled()) { vk_assemble(&v); return; }
+
+    switch (gs_prim & 7u) {
+    case PRIM_POINT:
+        shade_pixel(v.x >> 4, v.y >> 4, v.z, v.rgba, v.s, v.t, v.q);
+        gs_qn = 0;
+        break;
+    case PRIM_LINE:
+    case PRIM_LINESTRIP:
+        if (gs_qn >= 2) {
+            gs_vtx *a = &gs_queue[gs_qn - 2], *b = &gs_queue[gs_qn - 1];
+            s32 dx = (b->x - a->x) >> 4, dy = (b->y - a->y) >> 4;
+            s32 steps = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy)
+                      ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+            if (steps > 0 && steps < 4096) {
+                for (s32 i = 0; i <= steps; i++)
+                    shade_pixel((a->x >> 4) + dx * i / steps,
+                                (a->y >> 4) + dy * i / steps,
+                                b->z, b->rgba, b->s, b->t, b->q);
+            }
+            if ((gs_prim & 7u) == PRIM_LINE) gs_qn = 0;
+            else { gs_queue[0] = *b; gs_qn = 1; }
+        }
+        break;
+    case PRIM_TRI:
+        if (gs_qn == 3) { draw_triangle(&gs_queue[0], &gs_queue[1], &gs_queue[2]); gs_qn = 0; }
+        break;
+    case PRIM_TRISTRIP:
+        if (gs_qn == 3) {
+            draw_triangle(&gs_queue[0], &gs_queue[1], &gs_queue[2]);
+            gs_queue[0] = gs_queue[1];
+            gs_queue[1] = gs_queue[2];
+            gs_qn = 2;
+        }
+        break;
+    case PRIM_TRIFAN:
+        if (gs_qn == 3) {
+            draw_triangle(&gs_queue[0], &gs_queue[1], &gs_queue[2]);
+            gs_queue[1] = gs_queue[2];
+            gs_qn = 2;
+        }
+        break;
+    case PRIM_SPRITE:
+        if (gs_qn == 2) { draw_sprite(&gs_queue[0], &gs_queue[1]); gs_qn = 0; }
+        else if (gs_qn == 3) { draw_sprite(&gs_queue[1], &gs_queue[2]); gs_qn = 0; }
+        break;
+    default:
+        gs_qn = 0;
+        break;
+    }
+}
+
+static u64 gs_trxdir_hist[4];
+static u64 gs_stat_trxlocal;
+
+#define TRXCENSUS_N 96
+static struct { u32 dbp, dbw, dpsm, w, h, x, y; u64 n; u32 first[4]; int got; }
+    trxc[TRXCENSUS_N];
+static unsigned trxc_n;
+static int trxc_cur = -1;
+
+int ps2_diag_armed = 0;
+
+static void trx_census(u32 dbp, u32 dbw, u32 dpsm, u32 w, u32 h, u32 x, u32 y) {
+    if (!ps2_diag_armed) return;
+    unsigned i;
+    for (i = 0; i < trxc_n; i++)
+        if (trxc[i].dbp == dbp && trxc[i].dbw == dbw && trxc[i].dpsm == dpsm
+            && trxc[i].w == w && trxc[i].h == h && trxc[i].x == x
+            && trxc[i].y == y) { trxc[i].n++; trxc_cur = (int)i; return; }
+    if (trxc_n >= TRXCENSUS_N) { trxc_cur = -1; return; }
+    i = trxc_n++;
+    trxc[i].dbp = dbp; trxc[i].dbw = dbw; trxc[i].dpsm = dpsm;
+    trxc[i].w = w; trxc[i].h = h; trxc[i].x = x; trxc[i].y = y;
+    trxc[i].n = 1;
+    trxc_cur = (int)i;
+}
+
+void ps2_gs_trx_census_report(void) {
+    unsigned i;
+    ps2_log("GS TRXDIR: host->local %llu, local->host %llu, local->local %llu "
+            "(%llu executed), deactivated %llu",
+            (unsigned long long)gs_trxdir_hist[0],
+            (unsigned long long)gs_trxdir_hist[1],
+            (unsigned long long)gs_trxdir_hist[2],
+            (unsigned long long)gs_stat_trxlocal,
+            (unsigned long long)gs_trxdir_hist[3]);
+    ps2_log("GS host->local transfer census (%u distinct):", trxc_n);
+    for (i = 0; i < trxc_n; i++)
+        ps2_log("  dbp=%-7u dbw=%-4u psm=%-3u %4ux%-4u at (%u,%u)  x%llu  "
+                "first qw %08X%08X %08X%08X",
+                trxc[i].dbp, trxc[i].dbw, trxc[i].dpsm, trxc[i].w, trxc[i].h,
+                trxc[i].x, trxc[i].y, (unsigned long long)trxc[i].n,
+                trxc[i].first[1], trxc[i].first[0],
+                trxc[i].first[3], trxc[i].first[2]);
+}
+
+#define GS_FILL_N 1024
+static struct {
+    u32 dbp, dbw, psm;
+    u32 max_w, max_h;
+    u64 xfers, pixels;
+    u64 first_field, last_field;
+} gs_fill[GS_FILL_N];
+static unsigned gs_fill_n;
+static u64 gs_fill_dropped;
+
+static void gs_fill_note(u32 dbp, u32 dbw, u32 dpsm, u32 w, u32 h) {
+    unsigned i;
+    for (i = 0; i < gs_fill_n; i++)
+        if (gs_fill[i].dbp == dbp && gs_fill[i].dbw == dbw
+            && gs_fill[i].psm == dpsm) break;
+    if (i == gs_fill_n) {
+        if (gs_fill_n >= GS_FILL_N) { gs_fill_dropped++; return; }
+        gs_fill_n++;
+        gs_fill[i].dbp = dbp; gs_fill[i].dbw = dbw; gs_fill[i].psm = dpsm;
+        gs_fill[i].max_w = 0; gs_fill[i].max_h = 0;
+        gs_fill[i].xfers = 0; gs_fill[i].pixels = 0;
+        gs_fill[i].first_field = ps2_gs_frame_count;
+    }
+    if (w > gs_fill[i].max_w) gs_fill[i].max_w = w;
+    if (h > gs_fill[i].max_h) gs_fill[i].max_h = h;
+    gs_fill[i].xfers++;
+    gs_fill[i].pixels += (u64)w * h;
+    gs_fill[i].last_field = ps2_gs_frame_count;
+}
+
+void ps2_gs_fill_report(void) {
+    unsigned i, j, ord[GS_FILL_N];
+    ps2_log("GS cumulative fill census (%u buffers%s) -- every host->local "
+            "transfer since boot, by destination.  Biggest first; the terrain "
+            "atlases load during the mission load screen, so this is the only "
+            "table that can say whether they were ever filled:", gs_fill_n,
+            gs_fill_dropped ? " -- TABLE FULL" : "");
+    for (i = 0; i < gs_fill_n; i++) ord[i] = i;
+    for (i = 1; i < gs_fill_n; i++) {
+        u32 k = ord[i];
+        for (j = i; j > 0 && gs_fill[ord[j - 1]].pixels < gs_fill[k].pixels; j--)
+            ord[j] = ord[j - 1];
+        ord[j] = k;
+    }
+    for (i = 0; i < gs_fill_n; i++) {
+        unsigned e = ord[i];
+        if (i >= 64u && !(gs_fill[e].dbw == 512u && gs_fill[e].psm == 19u))
+            continue;
+        ps2_log("  dbp=%-8u dbw=%-4u psm=%-3u  %llu transfers, %llu pixels, "
+                "biggest %ux%u, fields %llu..%llu",
+                gs_fill[e].dbp, gs_fill[e].dbw, gs_fill[e].psm,
+                (unsigned long long)gs_fill[e].xfers,
+                (unsigned long long)gs_fill[e].pixels,
+                gs_fill[e].max_w, gs_fill[e].max_h,
+                (unsigned long long)gs_fill[e].first_field,
+                (unsigned long long)gs_fill[e].last_field);
+    }
+}
+
+static void gs_psm_geom(u32 psm, gs_geom *g);
+
+static void gs_dirty_rect(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y,
+                          u32 w, u32 h) {
+    gs_geom g;
+    u32 ppr, first, last;
+    if (!w || !h) return;
+    gs_psm_geom(dpsm, &g);
+    if (!dbw) dbw = g.pw;
+    ppr = dbw / g.pw;
+    if (!ppr) ppr = 1;
+    first = (y / g.ph) * ppr + (x / g.pw);
+    last  = gs_page_span(&g, dbw, x + w - 1u, y + h - 1u) - 1u;
+    if (last < first) last = first;
+    gs_fill_note(dbp, dbw, dpsm, w, h);
+    gs_dirty_owner = dbp | 1u;
+    gs_dirty_owner_bw = (u16)dbw;
+    gs_dirty_owner_psm = (u8)dpsm;
+    gs_mark_dirty(dbp + first * GS_PAGE_BYTES,
+                  dbp + (last + 1u) * GS_PAGE_BYTES);
+    gs_dirty_owner = 0;
+}
+
+#define TRXEXT_N 512
+static struct { u32 dbp, w, h, logs; int used; } trx_ext[TRXEXT_N];
+
+static u32 trx_ext_slot(u32 dbp) {
+    u32 h = (dbp >> 8) * 2654435761u;
+    return (h >> 23) & (TRXEXT_N - 1u);
+}
+
+static int trx_ext_find(u32 dbp, int make) {
+    u32 i = trx_ext_slot(dbp), n;
+    for (n = 0; n < TRXEXT_N; n++) {
+        u32 k = (i + n) & (TRXEXT_N - 1u);
+        if (trx_ext[k].used && trx_ext[k].dbp == dbp) return (int)k;
+        if (!trx_ext[k].used) {
+            if (!make) return -1;
+            trx_ext[k].used = 1;
+            trx_ext[k].dbp = dbp;
+            trx_ext[k].w = trx_ext[k].h = 0;
+            trx_ext[k].logs = 0;
+            return (int)k;
+        }
+    }
+    {   static u32 said;
+        if (make && said++ < 2u)
+            ps2_log("gs: transfer-extent table full (%u) -- dbp=%u is not "
+                    "being recorded", (unsigned)TRXEXT_N, dbp);
+    }
+    return -1;
+}
+
+static void trx_ext_note(u32 dbp, u32 x, u32 y, u32 w, u32 h) {
+    int i;
+    if (!w || !h) return;
+    i = trx_ext_find(dbp, 1);
+    if (i < 0) return;
+    if (x + w > trx_ext[i].w) trx_ext[i].w = x + w;
+    if (y + h > trx_ext[i].h) trx_ext[i].h = y + h;
+}
+
+static int trx_ext_get(u32 dbp, u32 *w, u32 *h) {
+    int i = trx_ext_find(dbp, 0);
+    if (i < 0) return 0;
+    *w = trx_ext[i].w; *h = trx_ext[i].h;
+    return 1;
+}
+
+static u32 trx_sum;
+
+#define TRXLOG_N 64
+static struct { u32 dbp, w, h, sum; } trx_log[TRXLOG_N];
+static u32 trx_log_n;
+
+void ps2_gs_trx_history(void) {
+    u32 have = trx_log_n < TRXLOG_N ? trx_log_n : TRXLOG_N;
+    u32 first = trx_log_n - have, k;
+    if (!have) return;
+    ps2_log("trx: last %u host->local transfers, oldest first:", have);
+    for (k = 0; k < have; k++) {
+        u32 i = (first + k) % TRXLOG_N;
+        ps2_log("   dbp=%-8u %ux%-4u sum=%08X", trx_log[i].dbp,
+                trx_log[i].w, trx_log[i].h, trx_log[i].sum);
+    }
+}
+
+static gs_geom trx_g;
+static u32 trx_dbp, trx_dbw, trx_dpsm, trx_ppr, trx_rrw, trx_sax, trx_npix;
+static u64 trx_bb_seen, trx_rg_seen, trx_pos_seen;
+static u32 trx_pixels_per_qw(u32 psm);
+
+static void trx_geom_sync(void) {
+    u64 bb = gs_reg[GS_BITBLTBUF], rg = gs_reg[GS_TRXREG];
+    u64 pos = gs_reg[GS_TRXPOS];
+    trx_bb_seen = bb; trx_rg_seen = rg; trx_pos_seen = pos;
+    trx_dbp  = (u32)((bb >> 32) & 0x3FFFull) * 256u;
+    trx_dbw  = (u32)((bb >> 48) & 0x3Full) * 64u;
+    trx_dpsm = (u32)((bb >> 56) & 0x3Full);
+    if (!trx_dbw) trx_dbw = 64u;
+    gs_psm_geom(trx_dpsm, &trx_g);
+    trx_ppr = trx_dbw / trx_g.pw;
+    if (!trx_ppr) trx_ppr = 1u;
+    trx_rrw = (u32)(rg & 0xFFFull);
+    trx_sax = (u32)((pos >> 32) & 0x7FFull);
+    trx_npix = trx_pixels_per_qw(trx_dpsm);
+}
+
+static void trx_begin(void) {
+    u64 pos = gs_reg[GS_TRXPOS], rg = gs_reg[GS_TRXREG];
+    u64 bbc = gs_reg[GS_BITBLTBUF];
+    trx_sum = 2166136261u;
+    trx_geom_sync();
+    {   /* debugging: PS2_TRACE_TRX_RANGE=lo:hi logs host->local transfers whose
+           DBP (bytes) falls in [lo, hi) */
+        static int parsed;
+        static u32 lo, hi;
+        if (!parsed) {
+            const char *e = getenv("PS2_TRACE_TRX_RANGE");
+            parsed = 1;
+            if (e) { char *end; lo = (u32)strtoul(e, &end, 0);
+                     hi = *end == ':' ? (u32)strtoul(end + 1, NULL, 0) : lo + 1u; }
+        }
+        u32 dbp = (u32)((bbc >> 32) & 0x3FFFull) * 256u;
+        if (hi && dbp >= lo && dbp < hi)
+            ps2_log("trx: frame %u dbp=%u dbw=%u psm=%u %ux%u at (%u,%u)",
+                    ps2_gs_frame_count, dbp, (u32)((bbc >> 48) & 0x3Full) * 64u,
+                    (u32)((bbc >> 56) & 0x3Full), (u32)(rg & 0xFFFull),
+                    (u32)((rg >> 32) & 0xFFFull), (u32)((pos >> 32) & 0x7FFull),
+                    (u32)((pos >> 48) & 0x7FFull));
+    }
+    gs_vram_epoch++;
+    gs_dirty_rect((u32)((bbc >> 32) & 0x3FFFull) * 256u,
+                  (u32)((bbc >> 48) & 0x3Full) * 64u,
+                  (u32)((bbc >> 56) & 0x3Full),
+                  (u32)((pos >> 32) & 0x7FFull), (u32)((pos >> 48) & 0x7FFull),
+                  (u32)(rg & 0xFFFull), (u32)((rg >> 32) & 0xFFFull));
+    gs_stat_trx++;
+    trx_ext_note((u32)((bbc >> 32) & 0x3FFFull) * 256u,
+                 (u32)((pos >> 32) & 0x7FFull), (u32)((pos >> 48) & 0x7FFull),
+                 (u32)(rg & 0xFFFull), (u32)((rg >> 32) & 0xFFFull));
+    trx_census((u32)((bbc >> 32) & 0x3FFFull) * 256u,
+               (u32)((bbc >> 48) & 0x3Full) * 64u,
+               (u32)((bbc >> 56) & 0x3Full),
+               (u32)(rg & 0xFFFull), (u32)((rg >> 32) & 0xFFFull),
+               (u32)((pos >> 32) & 0x7FFull), (u32)((pos >> 48) & 0x7FFull));
+    {
+        const char *w = PS2_ENV("PS2_WATCH_VRAM") ? getenv("PS2_WATCH_VRAM") : NULL;
+        if (w) {
+            u32 want = (u32)strtoul(w, NULL, 0);
+            u32 dbp = (u32)((bbc >> 32) & 0x3FFFull) * 256u;
+            if (dbp == want)
+                ps2_log("watch: frame %llu  transfer -> %u  dbw=%u psm=%u %ux%u",
+                        (unsigned long long)ps2_gs_frame_count, dbp,
+                        (u32)((bbc >> 48) & 0x3Full) * 64u,
+                        (u32)((bbc >> 56) & 0x3Full),
+                        (u32)(rg & 0xFFFull), (u32)((rg >> 32) & 0xFFFull));
+        }
+    }
+    if (PS2_ENV("PS2_TRACE_TRX")) {
+        static int shot;
+        if (!shot && (u32)((bbc >> 56) & 0x3Full) == PSM_T4) {
+            shot = 1;
+            ps2_dump_trace("first PSMT4 host->local transfer");
+        }
+    }
+    if (ps2_verbose && gs_stat_trx < 8) {
+        u64 bb = gs_reg[GS_BITBLTBUF];
+        ps2_log("trx: dbp=%u dbw=%u dpsm=%u  %ux%u at (%u,%u)  dir=%u",
+                (u32)((bb >> 32) & 0x3FFFull) * 256u,
+                (u32)((bb >> 48) & 0x3Full) * 64u,
+                (u32)((bb >> 56) & 0x3Full),
+                (u32)(rg & 0xFFFull), (u32)((rg >> 32) & 0xFFFull),
+                (u32)((pos >> 32) & 0x7FFull), (u32)((pos >> 48) & 0x7FFull),
+                (u32)(gs_reg[GS_TRXDIR] & 3ull));
+    }
+    trx_x = (u32)((pos >> 32) & 0x7FFull);
+    trx_y = (u32)((pos >> 48) & 0x7FFull);
+    trx_left = (u32)(rg & 0xFFFull) * (u32)((rg >> 32) & 0xFFFull);
+    trx24_n = 0;
+}
+
+static u32 trx_pixels_per_qw(u32 psm) {
+    switch (psm) {
+    case PSM_CT32: case PSM_CT24: case PSM_Z32: case PSM_Z24: return 2u;
+    case PSM_CT16: case PSM_CT16S: case PSM_Z16: case PSM_Z16S: return 4u;
+    case PSM_T8:  case PSM_T8H:  return 8u;
+    case PSM_T4:  case PSM_T4HL: case PSM_T4HH: return 16u;
+    default: return 2u;
+    }
+}
+
+static void trx_local_echo(u32 sbp, u32 sbw, u32 spsm, u32 sx, u32 sy,
+                           u32 w, u32 h, u32 dbp, u32 dx, u32 dy);
+
+static void trx_local(void) {
+    u64 bb = gs_reg[GS_BITBLTBUF], pos = gs_reg[GS_TRXPOS], rg = gs_reg[GS_TRXREG];
+    u32 sbp  = (u32)(bb & 0x3FFFull) * 256u;
+    u32 sbw  = (u32)((bb >> 16) & 0x3Full) * 64u;
+    u32 spsm = (u32)((bb >> 24) & 0x3Full);
+    u32 dbp  = (u32)((bb >> 32) & 0x3FFFull) * 256u;
+    u32 dbw  = (u32)((bb >> 48) & 0x3Full) * 64u;
+    u32 dpsm = (u32)((bb >> 56) & 0x3Full);
+    u32 ssax = (u32)(pos & 0x7FFull),        ssay = (u32)((pos >> 16) & 0x7FFull);
+    u32 dsax = (u32)((pos >> 32) & 0x7FFull), dsay = (u32)((pos >> 48) & 0x7FFull);
+    u32 dir  = (u32)((pos >> 59) & 3ull);
+    u32 w = (u32)(rg & 0xFFFull), h = (u32)((rg >> 32) & 0xFFFull);
+    u32 iy, ix;
+    if (!sbw) sbw = 64u;
+    if (!dbw) dbw = 64u;
+    if (!gs_vram || !w || !h) return;
+    gs_vram_epoch++;
+    {   static int shown = -1;
+        if (shown < 0) shown = getenv("PS2_RN_TEX_LOG_COPY") ? 0 : 1000;
+        if (shown < 40) {
+            shown++;
+            ps2_log("rn-tex: local copy %u (w%u psm%u) %u,%u -> %u (w%u psm%u) %u,%u %ux%u",
+                    sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, w, h);
+        }
+    }
+    /* a source the GPU drew: its pixels first, as far as the renderer has them */
+    if (dir == 0u) trx_local_echo(sbp, sbw, spsm, ssax, ssay, w, h, dbp, dsax, dsay);
+    if (getenv("PS2_LOCAL_DUMP") && w <= 256u && h <= 256u) {
+        /* debugging: the source of every local copy, as copied (8-bit) */
+        static u32 nd;
+        char nm[96];
+        FILE *f;
+        snprintf(nm, sizeof nm, "local_%03u_%u_%u_%u.pgm", nd++, dbp, dsax, dsay);
+        if ((f = fopen(nm, "wb")) != NULL) {
+            fprintf(f, "P5\n%u %u\n255\n", w, h);
+            for (iy = 0; iy < h; iy++)
+                for (ix = 0; ix < w; ix++)
+                    fputc((int)(vram_get(sbp, sbw, ssax + ix, ssay + iy, spsm) & 0xFFu), f);
+            fclose(f);
+        }
+    }
+    gs_dirty_rect(dbp, dbw, dpsm, dsax, dsay, w, h);
+    gs_stat_trxlocal++;
+    for (iy = 0; iy < h; iy++) {
+        u32 y = (dir == 1u || dir == 3u) ? h - 1u - iy : iy;
+        for (ix = 0; ix < w; ix++) {
+            u32 x = (dir >= 2u) ? w - 1u - ix : ix;
+            vram_put(dbp, dbw, dsax + x, dsay + y, dpsm,
+                     vram_get(sbp, sbw, ssax + x, ssay + y, spsm));
+        }
+    }
+    gs_stat_trxpix += (u64)w * h;
+}
+
+static void trx_data_inner(u64 qw);
+static void trx_data(u64 qw) {
+    PS2_PHASE_BEGIN(PS2_PH_TRX);
+    trx_data_inner(qw);
+    PS2_PHASE_END(PS2_PH_TRX);
+}
+/* PSMCT24/PSMZ24 uploads are packed: 3 bytes a pixel, so 16 pixels arrive in
+   3 quadwords (AC4 sends its font CLUTs this way to keep the alpha bytes).
+   The bytes are regrouped into pixel pairs for the 32-bit writer below, which
+   leaves the upper byte of each word alone. */
+static void trx_data_px(u64 qw);
+static void trx_data_inner(u64 qw) {
+    u32 dpsm = (u32)((gs_reg[GS_BITBLTBUF] >> 56) & 0x3Full);
+    u32 k;
+    if (PS2_LIKELY(dpsm != PSM_CT24 && dpsm != PSM_Z24) || !trx_left) {
+        trx24_n = 0;
+        trx_data_px(qw);
+        return;
+    }
+    for (k = 0; k < 8u; k++) trx24_buf[trx24_n++] = (u8)(qw >> (k * 8u));
+    while (trx_left && (trx24_n >= 6u || (trx24_n >= 3u && trx_left == 1u))) {
+        u32 used = trx24_n >= 6u ? 6u : 3u;
+        u64 p0 = (u64)trx24_buf[0] | ((u64)trx24_buf[1] << 8) | ((u64)trx24_buf[2] << 16);
+        u64 p1 = used == 6u ? ((u64)trx24_buf[3] | ((u64)trx24_buf[4] << 8)
+                               | ((u64)trx24_buf[5] << 16)) : 0u;
+        trx24_n -= used;
+        memmove(trx24_buf, trx24_buf + used, trx24_n);
+        trx_data_px(p0 | (p1 << 32));
+    }
+    if (!trx_left) trx24_n = 0;
+}
+static void trx_data_px(u64 qw) {
+    if (trxc_cur >= 0 && trxc[trxc_cur].got < 4) {
+        trxc[trxc_cur].first[trxc[trxc_cur].got++] = (u32)qw;
+        if (trxc[trxc_cur].got < 4)
+            trxc[trxc_cur].first[trxc[trxc_cur].got++] = (u32)(qw >> 32);
+    }
+    if (gs_reg[GS_BITBLTBUF] != trx_bb_seen
+        || gs_reg[GS_TRXREG] != trx_rg_seen
+        || gs_reg[GS_TRXPOS] != trx_pos_seen)
+        trx_geom_sync();
+    u32 dbp = trx_dbp, dbw = trx_dbw, dpsm = trx_dpsm;
+    u32 rrw = trx_rrw;
+    u32 n = trx_npix;
+    if (!dbw) dbw = 64u;
+    if (!gs_vram || !rrw) return;
+    u32 wrote = 0;
+    {
+        const u32 bits = trx_g.bits;
+        const u32 xend = trx_sax + rrw;
+        u32 sh, msk, i = 0;
+        int watch, traced;
+        if (!vram_watch_ready) vram_watch_init();
+        watch = vram_watch != 0xFFFFFFFFu;
+        traced = watch || PS2_ENV("PS2_TRACE_MPEG");
+        switch (n) {
+        case 2:  sh = 32; msk = 0xFFFFFFFFu; break;
+        case 8:  sh = 8;  msk = 0xFFu; break;
+        case 16: sh = 4;  msk = 0xFu; break;
+        default: sh = 16; msk = 0xFFFFu; break;
+        }
+        while (i < n && trx_left) {
+            const u32 xb = trx_x & trx_g.bwmask;
+            const u16 *off_row = trx_g.off
+                               + ((trx_y & trx_g.bhmask) << trx_g.bwsh);
+            u64 blkbit = vram_bit_g(&trx_g, dbp, trx_ppr, trx_x, trx_y)
+                       - off_row[xb];
+            u32 run = trx_g.bw - xb;
+            u32 k;
+            if (trx_x < xend && run > xend - trx_x) run = xend - trx_x;
+            if (run > n - i) run = n - i;
+            if (run > trx_left) run = trx_left;
+            if (!run) break;
+            if (PS2_UNLIKELY(traced)) {
+                for (k = 0; k < run; k++) {
+                    u64 bit = blkbit + off_row[xb + k];
+                    u32 px = (u32)((qw >> ((i + k) * sh)) & msk);
+                    u32 off = (u32)(bit >> 3);
+                    if (watch && off == vram_watch)
+                        ps2_log("watch: frame %llu  write %08X psm=%u via base=%u "
+                                "(%u,%u)", (unsigned long long)ps2_gs_frame_count,
+                                px, dpsm, dbp, trx_x + k, trx_y);
+                    vram_store_b(off, bit, dpsm, bits, px);
+                    trx_sum = (trx_sum ^ px) * 16777619u;
+                }
+            } else if (dpsm == PSM_T8) {
+                const u32 base = (u32)(blkbit >> 3);
+                if (base <= GS_VRAM_SIZE - 256u) {
+                    u8 *block = gs_vram + base;
+                    u64 packed = qw >> (i * 8u);
+                    for (k = 0; k < run; k++) {
+                        block[off_row[xb + k] >> 3] = (u8)packed;
+                        packed >>= 8;
+                    }
+                }
+            } else {
+                for (k = 0; k < run; k++) {
+                    u64 bit = blkbit + off_row[xb + k];
+                    u32 px = (u32)((qw >> ((i + k) * sh)) & msk);
+                    vram_store_b((u32)(bit >> 3), bit, dpsm, bits, px);
+                }
+            }
+            gs_stat_trxpix += run;
+            trx_x += run;
+            trx_left -= run;
+            i += run;
+            if (trx_x >= xend) { trx_x = trx_sax; trx_y++; }
+            wrote = 1;
+        }
+    }
+    if (wrote && !trx_left && PS2_ENV("PS2_TRACE_MPEG")) {
+        u64 rgp = gs_reg[GS_TRXREG];
+        u32 sl = trx_log_n++ % TRXLOG_N;
+        trx_log[sl].dbp = dbp;
+        trx_log[sl].w = (u32)(rgp & 0xFFFull);
+        trx_log[sl].h = (u32)((rgp >> 32) & 0xFFFull);
+        trx_log[sl].sum = trx_sum;
+    }
+    if (wrote && !trx_left)
+        gs_dirty_rect(dbp, dbw, dpsm,
+                      (u32)((gs_reg[GS_TRXPOS] >> 32) & 0x7FFull),
+                      (u32)((gs_reg[GS_TRXPOS] >> 48) & 0x7FFull),
+                      rrw, (u32)((gs_reg[GS_TRXREG] >> 32) & 0xFFFull));
+}
+
+/* Bulk host->local IMAGE data in the common formats.  AC4 sends about a
+   million texels a frame this way; trx_data_px handles 64 bits per call (two
+   texels in PSMCT32) and repeats its register, trace and geometry checks each
+   time.  This walks the whole GIF payload in one loop, block row by block row,
+   writing exactly what trx_data_px would.  Returns 0 when the transfer needs
+   the general path (traces, the transfer census, other formats). */
+static int trx_bulk_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PS2_TRX_NOBULK");
+        v = !(e && *e && *e != '0');
+    }
+    return v;
+}
+
+static int trx_bulk(const u8 *src, u32 qwc) {
+    const gs_geom *g = &trx_g;
+    u32 bits, xend;
+    u64 avail, pi = 0;
+    if (gs_reg[GS_BITBLTBUF] != trx_bb_seen || gs_reg[GS_TRXREG] != trx_rg_seen
+        || gs_reg[GS_TRXPOS] != trx_pos_seen)
+        trx_geom_sync();
+    if (trx_dpsm != PSM_CT32 && trx_dpsm != PSM_CT16 && trx_dpsm != PSM_CT16S
+        && trx_dpsm != PSM_T8 && trx_dpsm != PSM_T4)
+        return 0;
+    if (!gs_vram || !trx_rrw || !trx_left) return 0;
+    if (trxc_cur >= 0 && trxc[trxc_cur].got < 4) return 0;
+    if (!vram_watch_ready) vram_watch_init();
+    if (vram_watch != 0xFFFFFFFFu || PS2_ENV("PS2_TRACE_MPEG")) return 0;
+    bits = g->bits;
+    if (bits != 32u && bits != 16u && bits != 8u && bits != 4u) return 0;
+    xend = trx_sax + trx_rrw;
+    avail = (u64)qwc * 128u / bits;
+    while (pi < avail && trx_left) {
+        const u32 xb = trx_x & g->bwmask;
+        const u16 *off_row = g->off + ((trx_y & g->bhmask) << g->bwsh);
+        const u64 blkbit = vram_bit_g(g, trx_dbp, trx_ppr, trx_x, trx_y) - off_row[xb];
+        const u32 base = (u32)(blkbit >> 3);
+        u32 run = g->bw - xb, k;
+        if (trx_x < xend && run > xend - trx_x) run = xend - trx_x;
+        if (run > avail - pi) run = (u32)(avail - pi);
+        if (run > trx_left) run = trx_left;
+        if (!run) break;
+        if (base <= GS_VRAM_SIZE - 256u) {
+            u8 *block = gs_vram + base;
+            const u16 *o = off_row + xb;
+            switch (bits) {
+            case 32: {
+                const u8 *s = src + pi * 4u;
+                for (k = 0; k < run; k++) memcpy(block + (o[k] >> 3), s + k * 4u, 4);
+                break;
+            }
+            case 16: {
+                const u8 *s = src + pi * 2u;
+                for (k = 0; k < run; k++) memcpy(block + (o[k] >> 3), s + k * 2u, 2);
+                break;
+            }
+            case 8: {
+                const u8 *s = src + pi;
+                for (k = 0; k < run; k++) block[o[k] >> 3] = s[k];
+                break;
+            }
+            default:
+                for (k = 0; k < run; k++) {
+                    const u64 p = pi + k;
+                    const u32 v = (src[p >> 1] >> ((p & 1u) * 4u)) & 0xFu;
+                    u8 *b = block + (o[k] >> 3);
+                    *b = (o[k] & 4u) ? (u8)((*b & 0x0Fu) | (v << 4))
+                                     : (u8)((*b & 0xF0u) | v);
+                }
+                break;
+            }
+        }
+        gs_stat_trxpix += run;
+        pi += run;
+        trx_x += run;
+        trx_left -= run;
+        if (trx_x >= xend) { trx_x = trx_sax; trx_y++; }
+    }
+    if (pi && !trx_left)
+        gs_dirty_rect(trx_dbp, trx_dbw, trx_dpsm,
+                      (u32)((gs_reg[GS_TRXPOS] >> 32) & 0x7FFull),
+                      (u32)((gs_reg[GS_TRXPOS] >> 48) & 0x7FFull),
+                      trx_rrw, (u32)((gs_reg[GS_TRXREG] >> 32) & 0xFFFull));
+    return 1;
+}
+
+static u32 clut_entry_at(u32 cbp, u32 cpsm, u32 csm, u32 csa, u32 psm, u32 idx);
+static u32 clut_entry(u32 idx) {
+    u64 t0 = tex0_reg();
+    return clut_entry_at((u32)((t0 >> 37) & 0x3FFFull) * 256u,
+                         (u32)((t0 >> 51) & 0xFull), (u32)((t0 >> 55) & 1ull),
+                         (u32)((t0 >> 56) & 0x1Full), (u32)((t0 >> 20) & 0x3Full),
+                         idx);
+}
+
+/* The current 256-entry CLUT as a 256x1 texture, colours converted the way
+   the texture decoder converts them (alpha 0x80 -> 255).  For PSMT8H draws
+   whose indices live in a render target: gs.frag reads them there. */
+static u32 clut_palette_texture(u64 t0) {
+    u8 rgba[256 * 4];
+    u32 hash = 2166136261u, e;
+    u64 key;
+    for (e = 0; e < 256u; e++) {
+        u32 c = clut_entry(e);
+        u32 a = (c >> 24) & 0xFFu;
+        a = a >= 128u ? 255u : a * 2u;
+        c = (c & 0x00FFFFFFu) | (a << 24);
+        memcpy(rgba + e * 4u, &c, 4);
+        hash = (hash ^ c) * 16777619u;
+    }
+    /* psm field 0x3E marks a palette: no GS texture format uses it */
+    key = ((u64)((t0 >> 37) & 0x3FFFull) << 40) | ((u64)((t0 >> 51) & 0x1FFull) << 28)
+        | (0x3Eull << 20) | (256u << 4) | 1u;
+    return ps2_vk_texture(key, hash, rgba, 256u, 1u);
+}
+
+static u32 clut_entry_at(u32 cbp, u32 cpsm, u32 csm, u32 csa, u32 psm, u32 idx) {
+    int four = (psm == PSM_T4 || psm == PSM_T4HL || psm == PSM_T4HH);
+    u32 e = csa * 16u + idx;
+    u32 cw, cx, cy, raw;
+
+    if (csm) {
+        u64 tc = gs_reg[GS_TEXCLUT];
+        cw = (u32)(tc & 0x3Full) * 64u;
+        if (!cw) cw = 64u;
+        cx = (u32)(((tc >> 6) & 0x3Full) * 16ull) + e;
+        cy = (u32)((tc >> 12) & 0x3FFull);
+    } else if (four) {
+        cw = 64u;
+        cx = e % 8u;
+        cy = e / 8u;
+    } else {
+        u32 p = (e & ~0x18u) | ((e & 0x08u) << 1) | ((e & 0x10u) >> 1);
+        cw = 64u;
+        cx = p % 16u;
+        cy = p / 16u;
+    }
+
+    if (cpsm == PSM_CT16 || cpsm == PSM_CT16S) {
+        u32 r, g, b, a;
+        raw = vram_get(cbp, cw, cx, cy, PSM_CT16);
+        r = (raw & 0x1Fu) << 3;
+        g = ((raw >> 5) & 0x1Fu) << 3;
+        b = ((raw >> 10) & 0x1Fu) << 3;
+        a = (raw >> 15) & 1u ? 0x80u : 0u;
+        return r | (g << 8) | (b << 16) | (a << 24);
+    }
+    return vram_get(cbp, cw, cx, cy, PSM_CT32);
+}
+
+static u32 texa_alpha(u32 abit, int rgb_zero) {
+    u64 texa = gs_reg[GS_TEXA];
+    u32 ta0 = (u32)(texa & 0xFFull);
+    u32 aem = (u32)((texa >> 15) & 1ull);
+    u32 ta1 = (u32)((texa >> 32) & 0xFFull);
+    if (aem && rgb_zero) return 0u;
+    return abit ? ta1 : ta0;
+}
+
+static u32 texel_rgba(u32 raw, u32 psm) {
+    u32 r, g, b, a;
+    switch (psm) {
+    case 0:
+        a = (raw >> 24) & 0xFFu;
+        a = a >= 128u ? 255u : a * 2u;
+        return (raw & 0x00FFFFFFu) | (a << 24);
+    case 1:
+        a = texa_alpha(0u, (raw & 0x00FFFFFFu) == 0u);
+        a = a >= 128u ? 255u : a * 2u;
+        return (raw & 0x00FFFFFFu) | (a << 24);
+    case 2: case 10:
+        r = (raw & 0x1Fu) << 3;
+        g = ((raw >> 5) & 0x1Fu) << 3;
+        b = ((raw >> 10) & 0x1Fu) << 3;
+        a = texa_alpha((raw >> 15) & 1u, (raw & 0x7FFFu) == 0u);
+        a = a >= 128u ? 255u : a * 2u;
+        return r | (g << 8) | (b << 16) | (a << 24);
+    case PSM_T8: case PSM_T4: case PSM_T8H:
+    case PSM_T4HL: case PSM_T4HH: {
+        u32 c = clut_entry(raw & 0xFFu);
+        a = (c >> 24) & 0xFFu;
+        a = a >= 128u ? 255u : a * 2u;
+        return (c & 0x00FFFFFFu) | (a << 24);
+    }
+    default:
+        return raw | 0xFF000000u;
+    }
+}
+
+static u8 *tex_scratch;
+static u32 tex_scratch_cap;
+
+#define TEXCACHE_N 256
+#define TEXIDX_N   1024
+static struct {
+    u64 t0, clut;
+    u32 epoch;
+    u64 checked_seq;
+    u32 tlo, thi;
+    u32 tbw;
+    u32 clo, chi;
+    u32 lod;
+    u32 index; float w, h; int used;
+    u64 skey; u32 shash;
+} texcache[TEXCACHE_N];
+static u32 texcache_next;
+static u16 texidx[TEXIDX_N];
+static u64 texmembers[TEXIDX_N][TEXCACHE_N / 64];
+static u32 texcache_index_next(u32 bucket, u32 *cursor) {
+    while (*cursor < TEXCACHE_N) {
+        u32 word = *cursor / 64u, bit = *cursor & 63u;
+        u64 members = texmembers[bucket][word] & (~(u64)0 << bit);
+        if (members) {
+            u32 slot = word * 64u + (u32)__builtin_ctzll(members);
+            *cursor = slot + 1u;
+            return slot;
+        }
+        *cursor = (word + 1u) * 64u;
+    }
+    return TEXCACHE_N;
+}
+static u64 texcache_hits, texcache_misses, texcache_texels, texcache_scan;
+static u64 texcache_fast;   /* decodes the raw-block short-cut answered */
+
+static u32 texcache_bucket(u64 t0, u64 clut, u32 lod) {
+    u64 h = t0 * 0x9E3779B97F4A7C15ull;
+    h ^= clut + 0x165667B19E3779F9ull + (h << 6) + (h >> 2);
+    h ^= (u64)lod * 0xD6E8FEB86659FD93ull;
+    return (u32)((h >> 29) & (TEXIDX_N - 1u));
+}
+
+void ps2_gs_tex_cache_stats(u64 *hits, u64 *misses, u64 *texels, u64 *scan) {
+    if (hits) *hits = texcache_hits;
+    if (misses) *misses = texcache_misses;
+    if (texels) *texels = texcache_texels;
+    if (scan) *scan = texcache_scan;
+}
+
+#define TEXCENSUS_N 96
+static struct { u32 tbp, tbw, psm, tw, th, cbp, amax_min, amax_max, nz_max; u64 n; }
+    texc[TEXCENSUS_N];
+static unsigned texc_n;
+
+void ps2_gs_tex_cache_report(void) {
+    u64 tot = texcache_hits + texcache_misses;
+    ps2_log("GS texture cache: %llu hits, %llu decodes (%.1f%% hit)%s",
+            (unsigned long long)texcache_hits,
+            (unsigned long long)texcache_misses,
+            tot ? 100.0 * (double)texcache_hits / (double)tot : 0.0,
+            texcache_misses > texcache_hits
+            ? "  <-- decoding more often than reusing" : "");
+    if (texcache_misses)
+        ps2_log("GS texture decode short-cut: %llu of %llu decodes matched a previous one "
+                "by their raw GS blocks (%.1f%%) and were not decoded again",
+                (unsigned long long)texcache_fast, (unsigned long long)texcache_misses,
+                100.0 * (double)texcache_fast / (double)texcache_misses);
+    if (fs_memo_hits + fs_memo_misses)
+        ps2_log("GS draw state: worked out %llu times, reused unchanged %llu times "
+                "(%.1f%%)", (unsigned long long)fs_memo_misses,
+                (unsigned long long)fs_memo_hits,
+                100.0 * (double)fs_memo_hits / (double)(fs_memo_hits + fs_memo_misses));
+}
+
+void ps2_gs_tex_census_report(void) {
+    unsigned i;
+    ps2_log("GS texture-binding census (%u distinct):", texc_n);
+    for (i = 0; i < texc_n; i++)
+        ps2_log("  tbp=%-7u tbw=%-4u psm=%-3u %4ux%-4u cbp=%-7u x%llu  "
+                "alpha_max %u..%u  non-black<=%u/%u",
+                texc[i].tbp, texc[i].tbw, texc[i].psm, texc[i].tw, texc[i].th,
+                texc[i].cbp, (unsigned long long)texc[i].n,
+                texc[i].amax_min, texc[i].amax_max, texc[i].nz_max,
+                texc[i].tw * texc[i].th);
+}
+
+#define TEXOVL_N 256
+static struct {
+    u32 tbp, owner, psm, tw, th, tbw;
+    u32 owner_bw, owner_psm;
+    u32 pages, foreign;
+    u64 n;
+} texovl[TEXOVL_N];
+static unsigned texovl_n;
+static u64 texovl_dropped;
+
+#define TEXSELF_N 64
+static struct { u32 tbp, psm, tw, th, pages, self, foreign, unwritten; u64 n; }
+    texself[TEXSELF_N];
+static unsigned texself_n;
+
+static void texovl_note(u32 tbp, u32 psm, u32 tbw, u32 tw, u32 th) {
+    gs_geom g;
+    u32 pages, p0, k, own = tbp | 1u;
+    struct { u32 owner, bw, tpsm, n; } top[8];
+    unsigned ntop = 0, i;
+    if (!tw || !th) return;
+    gs_psm_geom(psm, &g);
+    if (!tbw) tbw = g.pw;
+    pages = gs_page_span(&g, tbw, tw - 1u, th - 1u);
+    if (pages < 2u) return;
+    p0 = tbp / GS_PAGE_BYTES;
+    for (k = 0; k < pages && p0 + k < GS_VRAM_PAGES; k++) {
+        u32 o = gs_page_owner[p0 + k];
+        if (!o || o == own) continue;
+        for (i = 0; i < ntop; i++) if (top[i].owner == o) { top[i].n++; break; }
+        if (i == ntop && ntop < 8u) {
+            top[ntop].owner = o;
+            top[ntop].bw = gs_page_owner_bw[p0 + k];
+            top[ntop].tpsm = gs_page_owner_psm[p0 + k];
+            top[ntop].n = 1;
+            ntop++;
+        }
+    }
+    {
+        unsigned j;
+        u32 self = 0, foreign = 0, unwritten = 0;
+        for (k = 0; k < pages && p0 + k < GS_VRAM_PAGES; k++) {
+            u32 o = gs_page_owner[p0 + k];
+            if (!gs_page_epoch[p0 + k]) unwritten++;
+            else if (o == own) self++;
+            else foreign++;
+        }
+        for (j = 0; j < texself_n; j++)
+            if (texself[j].tbp == tbp && texself[j].tw == tw
+                && texself[j].th == th && texself[j].psm == psm) break;
+        if (j == texself_n && texself_n < TEXSELF_N) {
+            texself_n++;
+            texself[j].tbp = tbp; texself[j].psm = psm;
+            texself[j].tw = tw; texself[j].th = th;
+            texself[j].pages = pages; texself[j].n = 0;
+        }
+        if (j < texself_n) {
+            texself[j].self = self; texself[j].foreign = foreign;
+            texself[j].unwritten = unwritten; texself[j].n++;
+        }
+    }
+    for (i = 0; i < ntop; i++) {
+        unsigned j;
+        for (j = 0; j < texovl_n; j++)
+            if (texovl[j].tbp == tbp && texovl[j].owner == top[i].owner
+                && texovl[j].tw == tw && texovl[j].th == th) break;
+        if (j == texovl_n) {
+            if (texovl_n >= TEXOVL_N) { texovl_dropped++; continue; }
+            texovl_n++;
+            texovl[j].tbp = tbp; texovl[j].owner = top[i].owner;
+            texovl[j].psm = psm; texovl[j].tw = tw; texovl[j].th = th;
+            texovl[j].tbw = tbw;
+            texovl[j].owner_bw = top[i].bw; texovl[j].owner_psm = top[i].tpsm;
+            texovl[j].pages = pages; texovl[j].foreign = 0; texovl[j].n = 0;
+        }
+        if (top[i].n > texovl[j].foreign) texovl[j].foreign = top[i].n;
+        texovl[j].n++;
+    }
+}
+
+void ps2_gs_texovl_report(void) {
+    unsigned i, j, ord[TEXOVL_N];
+    if (texself_n) {
+        ps2_log("GS texture page provenance -- of the pages each texture "
+                "covers, how many its OWN buffer last wrote, how many another "
+                "buffer wrote, and how many nothing has ever written:");
+        for (i = 0; i < texself_n; i++)
+            ps2_log("  tex tbp=%-8u psm=%-3u %4ux%-4u  %2u pages: "
+                    "own %2u  foreign %2u  never-written %2u   (%llu decodes)",
+                    texself[i].tbp, texself[i].psm, texself[i].tw,
+                    texself[i].th, texself[i].pages, texself[i].self,
+                    texself[i].foreign, texself[i].unwritten,
+                    (unsigned long long)texself[i].n);
+    }
+    if (!texovl_n) {
+        ps2_log("GS texture/transfer overlap: none -- every texture decoded "
+                "from pages its own buffer last wrote");
+        return;
+    }
+    ps2_log("GS texture/transfer overlap (%u distinct%s): a texture whose "
+            "pixels were last written by a transfer naming a DIFFERENT buffer "
+            "is drawing that buffer's picture, not its own.", texovl_n,
+            texovl_dropped ? " -- TABLE FULL, more were dropped" : "");
+    for (i = 0; i < texovl_n; i++) ord[i] = i;
+    for (i = 1; i < texovl_n; i++) {
+        u32 k = ord[i];
+        for (j = i; j > 0
+             && texovl[ord[j - 1]].foreign < texovl[k].foreign; j--)
+            ord[j] = ord[j - 1];
+        ord[j] = k;
+    }
+    for (i = 0; i < texovl_n; i++) {
+        unsigned e = ord[i];
+        u32 ob = texovl[e].tbp, ow = texovl[e].owner & ~1u;
+        const char *kind =
+            (ow >= ob && ow < ob + texovl[e].pages * GS_PAGE_BYTES
+             && texovl[e].owner_bw == texovl[e].tbw) ? "SELF-strip"
+                                                        : "OTHER-buffer";
+        ps2_log("  tex tbp=%-8u psm=%-3u %4ux%-4u  <- transfer dbp=%-8u "
+                "dbw=%-4u psm=%-3u [%s]  covers %u of its %u pages (%u%%)  "
+                "(%llu decodes)",
+                texovl[e].tbp, texovl[e].psm, texovl[e].tw, texovl[e].th,
+                ow, texovl[e].owner_bw, texovl[e].owner_psm, kind,
+                texovl[e].foreign, texovl[e].pages,
+                texovl[e].pages ? 100u * texovl[e].foreign / texovl[e].pages : 0u,
+                (unsigned long long)texovl[e].n);
+    }
+}
+
+static int tex_nocache(void) {
+    static int nocache = -1;
+    if (nocache < 0) {
+        const char *e = getenv("PS2_TEX_NOCACHE");
+        nocache = (e && *e && *e != '0') ? 1 : 0;
+        if (nocache) ps2_log("GS: texture cache disabled (PS2_TEX_NOCACHE)");
+    }
+    return nocache;
+}
+
+static int texcache_find(u64 t0, u64 clut, u32 lod, u32 *idx,
+                         float *out_w, float *out_h) {
+    u32 bucket = texcache_bucket(t0, clut, lod);
+    u32 i, cursor = 0, cand = (u32)texidx[bucket];
+    for (i = 0; ; i++) {
+        u32 e, s;
+        if (i == 0) {
+            if (!cand) continue;
+            s = cand - 1u;
+        } else {
+            s = texcache_index_next(bucket, &cursor);
+            if (s == TEXCACHE_N) break;
+            if (cand && s == cand - 1u) continue;
+            texcache_scan++;
+        }
+        if (!texcache[s].used) continue;
+        if (texcache[s].t0 != t0 || texcache[s].clut != clut) continue;
+        if (texcache[s].lod != lod) continue;
+        if (texcache[s].checked_seq != gs_validation_seq) {
+            e = gs_content_epoch(texcache[s].tlo, texcache[s].tbw,
+                             texcache[s].tlo, texcache[s].thi);
+            { u32 c = gs_range_epoch(texcache[s].clo, texcache[s].chi);
+              if (c > e) e = c; }
+            if (e > texcache[s].epoch) continue;
+            texcache[s].checked_seq = gs_validation_seq;
+        }
+        if (texcache[s].index != 0xFFFFFFFFu
+            && !ps2_vk_texture_is(texcache[s].index, texcache[s].skey,
+                                  texcache[s].shash)) {
+            texmembers[bucket][s / 64u] &= ~((u64)1 << (s & 63u));
+            texcache[s].used = 0;
+            if (texidx[bucket] == (u16)(s + 1u)) texidx[bucket] = 0;
+            continue;
+        }
+        texcache_hits++;
+        texidx[bucket] = (u16)(s + 1u);
+        *out_w = texcache[s].w;
+        *out_h = texcache[s].h;
+        *idx = texcache[s].index;
+        return 1;
+    }
+    return 0;
+}
+
+static void tex_extent(u64 t0, u32 lod, u32 *tbp_io, u32 *tbw_io, u32 *tw_io,
+                       u32 *th_io, float *out_w, float *out_h) {
+    u32 tbp = *tbp_io, tbw = *tbw_io, tw = *tw_io, th = *th_io;
+    u32 psm = (u32)((t0 >> 20) & 0x3Full);
+    if (tw > 1024u) tw = 1024u;
+    if (th > 1024u) th = 1024u;
+    if (!tbw) tbw = tw;
+    gs_mip_level(lod, psm, &tbp, &tbw, &tw, &th);
+    *out_w = (float)tw;
+    *out_h = (float)th;
+    if (tw > tbw) tw = tbw;
+    {
+        u32 ew, eh;
+        if (trx_ext_get(tbp, &ew, &eh)) {
+            gs_geom eg;
+            u32 eppr, pages, p0, k, top = 0, cols = 0;
+            gs_psm_geom(psm, &eg);
+            eppr = tbw / eg.pw;
+            if (!eppr) eppr = 1;
+            pages = gs_page_span(&eg, tbw, tw - 1u, th - 1u);
+            p0 = tbp / GS_PAGE_BYTES;
+            /* Pages beyond the uploads to this address count only when they
+               were written about as recently as the upload itself: a texture
+               put together from several uploads arrives within a field or
+               two, while older pages belong to whatever lived there before.
+               AC4's movies stream each frame through one 16x336 column at a
+               time into a 64x1024 texture whose lower pages hold old data;
+               decoding all of it every column saturated the GS thread
+               (52-56 fields/s, the picture falling behind the sound). */
+            {
+                u32 kspan = gs_page_span(&eg, tbw, (ew ? ew : 1u) - 1u, (eh ? eh : 1u) - 1u);
+                u32 newest = 0;
+                for (k = 0; k < kspan && k < pages && p0 + k < GS_VRAM_PAGES; k++)
+                    if (gs_page_epoch[p0 + k] && gs_page_field[p0 + k] > newest)
+                        newest = gs_page_field[p0 + k];
+                for (k = 0; k < pages && p0 + k < GS_VRAM_PAGES; k++)
+                    if (gs_page_epoch[p0 + k]
+                        && (k < kspan || PS2_ENV("PS2_TEX_OLD_EXTENT")
+                            || gs_page_field[p0 + k] + 2u >= newest)) {
+                    top = k + 1u;
+                    if ((k % eppr) + 1u > cols) cols = (k % eppr) + 1u;
+                }
+            }
+            if (top && ew && eh
+                && gs_page_span(&eg, tbw, ew - 1u, eh - 1u) < top) {
+                ew = cols * eg.pw;
+                eh = ((top + eppr - 1u) / eppr) * eg.ph;
+            }
+            if (ew && tw > ew) tw = ew;
+            if (eh && th > eh) th = eh;
+        }
+    }
+    *tbp_io = tbp; *tbw_io = tbw; *tw_io = tw; *th_io = th;
+}
+
+/* Decode short-cut.  AC4 streams its textures through 4 MB of GS memory again
+   every frame, so a cached decode is invalidated by an upload that writes the
+   very bytes it already held, and the texture is decoded again only to hash
+   to a Vulkan texture that already exists (in Mission 05 about 95% of all
+   decodes).  Hashing the raw GS blocks the decode would read -- 256 bytes at a
+   time, through the same page shadows -- identifies a repeat for a fraction of
+   the cost; the previous decode's Vulkan texture is then reused as is.
+   Anything the decode depends on besides those blocks (TEX0/CLUT registers,
+   mip level, extent, palette) is part of the key.  PS2_TEX_NOFAST=1 disables. */
+#define TEXFAST_N 8192u
+static struct { u64 k; u32 idx, shash; } texfast[TEXFAST_N];
+
+void ps2_vk_texture_touch(u32 idx);
+int ps2_vk_texture_is(u32 idx, u64 key, u32 hash);
+
+static int texfast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = !(getenv("PS2_TEX_NOFAST") || getenv("PS2_DUMP_TEX") || getenv("PS2_DUMP_TEX_IDX")
+              || getenv("PS2_WATCH_VRAM") || getenv("PS2_TEX_DETAIL") || getenv("PS2_LOG_CLUT")
+              || tex_nocache());
+        if (!v) ps2_log("GS: texture decode short-cut off");
+    }
+    return v && !ps2_diag_armed && !ps2_verbose;
+}
+
+static inline u64 texfast_mix(u64 h, u64 v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h * 0xFF51AFD7ED558CCDull;
+}
+
+static u64 tex_raw_hash(const gs_geom *g, u32 tbp, u32 ppr, u32 tw, u32 th, int redirect) {
+    u64 h0 = 0x243F6A8885A308D3ull, h1 = 0x13198A2E03707344ull;
+    u64 h2 = 0xA4093822299F31D0ull, h3 = 0x082EFA98EC4E6C89ull;
+    for (u32 y = 0; y < th; y += g->bh) {
+        const u32 page_row = (y >> g->phsh) * ppr;
+        const u8 *blk_row = g->tab + (size_t)((y & g->phmask) >> g->bhsh) * g->tabcols;
+        const u64 row_bit = (u64)tbp * 8u + (u64)page_row * 65536u;
+        for (u32 x = 0; x < tw; x += g->bw) {
+            u64 blkbit = row_bit + (u64)(x >> g->pwsh) * 65536u
+                       + (u64)blk_row[(x & g->pwmask) >> g->bwsh] * 2048u;
+            u32 base = (u32)(blkbit >> 3);
+            const u8 *src = gs_vram + base;
+            u64 w[32];
+            if (base > GS_VRAM_SIZE - 256u) {
+                h0 = texfast_mix(h0, 0xDEADull + base);
+                continue;
+            }
+            if (redirect) {
+                u32 pg = (u32)(blkbit >> 16);
+                if (pg < GS_VRAM_PAGES && gs_pagebase[pg] != gs_vram)
+                    src = gs_pagebase[pg] + (base - pg * GS_PAGE_BYTES);
+            }
+            memcpy(w, src, sizeof w);
+            for (u32 k = 0; k < 32u; k += 4u) {
+                h0 = (h0 ^ w[k])      * 0x9E3779B97F4A7C15ull;
+                h1 = (h1 ^ w[k + 1u]) * 0xC2B2AE3D27D4EB4Full;
+                h2 = (h2 ^ w[k + 2u]) * 0x165667B19E3779F9ull;
+                h3 = (h3 ^ w[k + 3u]) * 0x27D4EB2F165667C5ull;
+                h0 ^= h0 >> 29; h1 ^= h1 >> 31; h2 ^= h2 >> 27; h3 ^= h3 >> 33;
+            }
+        }
+    }
+    return texfast_mix(texfast_mix(h0, h1), texfast_mix(h2, h3));
+}
+
+static u32 current_texture_inner(float *out_w, float *out_h);
+static u32 current_texture(float *out_w, float *out_h) {
+    u32 r;
+    PS2_PHASE_BEGIN(PS2_PH_TEX);
+    r = current_texture_inner(out_w, out_h);
+    PS2_PHASE_END(PS2_PH_TEX);
+    return r;
+}
+
+static u32 current_texture_inner(float *out_w, float *out_h) {
+    u64 t0 = tex0_reg();
+    u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
+    u32 tbw = (u32)((t0 >> 14) & 0x3Full) * 64u;
+    u32 psm = (u32)((t0 >> 20) & 0x3Full);
+    u32 tw = 1u << ((t0 >> 26) & 0xFull);
+    u32 th = 1u << ((t0 >> 30) & 0xFull);
+    u32 lod = gs_tex_lod();
+    u32 need, hash = 2166136261u, y, x;
+    u64 key, clut = gs_reg[GS_TEXCLUT];
+    const int fast_ok = texfast_enabled();
+    u64 fast_key = 0;
+    u32 fast_slot = 0, fast_idx = 0xFFFFFFFFu;
+    if (!gs_vram) return 0xFFFFFFFFu;
+    if (tex_index_mode) clut ^= 1ull << 63;   /* indices, not colours: own cache entry */
+    if (!tex_nocache()) {
+        u32 idx;
+        if (texcache_find(t0, clut, lod, &idx, out_w, out_h)) return idx;
+    }
+    texcache_misses++;
+    tex_extent(t0, lod, &tbp, &tbw, &tw, &th, out_w, out_h);
+    texovl_note(tbp, psm, tbw, tw, th);
+    need = tw * th * 4u;
+    if (need > tex_scratch_cap) {
+        u8 *n = (u8 *)realloc(tex_scratch, need);
+        if (!n) return 0xFFFFFFFFu;
+        tex_scratch = n;
+        tex_scratch_cap = need;
+    }
+    {
+        gs_geom g;
+        u32 ppr, indexed = (psm == PSM_T8 || psm == PSM_T4 || psm == PSM_T8H
+                            || psm == PSM_T4HL || psm == PSM_T4HH);
+        u32 pal[256];
+        gs_psm_geom(psm, &g);
+        ppr = tbw / g.pw;
+        if (!ppr) ppr = 1;
+        if (indexed) {
+            u32 n = (psm == PSM_T4 || psm == PSM_T4HL || psm == PSM_T4HH)
+                    ? 16u : 256u;
+            u32 e;
+            for (e = 0; e < n; e++) {
+                u32 c = clut_entry(e);
+                u32 a = (c >> 24) & 0xFFu;
+                a = a >= 128u ? 255u : a * 2u;
+                pal[e] = (c & 0x00FFFFFFu) | (a << 24);
+                if (tex_index_mode) {
+                    /* the CLUT entry number (T4: CSA*16 + index) in every channel */
+                    u32 ent = n == 16u ? ((u32)((t0 >> 56) & 0x1Full) * 16u + e) & 255u : e;
+                    pal[e] = ent * 0x010101u | 0xFF000000u;
+                }
+            }
+            {   /* debugging: PS2_LOG_CLUT=<cbp bytes> logs that CLUT once */
+                static long want = -2;
+                if (want == -2) {
+                    const char *ev = getenv("PS2_LOG_CLUT");
+                    want = ev ? strtol(ev, NULL, 0) : -1;
+                }
+                if (want >= 0 && (u32)want == (u32)((t0 >> 37) & 0x3FFFull) * 256u) {
+                    char line[600];
+                    for (u32 r0 = 0; r0 < n; r0 += 32) {
+                        int k = 0;
+                        for (u32 q = r0; q < r0 + 32 && q < n; q++)
+                            k += snprintf(line + k, sizeof line - (size_t)k, " %08X",
+                                          clut_entry(q));
+                        ps2_log("clut %u [%3u..]:%s", (u32)want, r0, line);
+                    }
+                    want = -1;
+                }
+            }
+            for (e = 0; e < (psm == PSM_T4 || psm == PSM_T4HL
+                             || psm == PSM_T4HH ? 16u : 256u); e++)
+                hash = (hash ^ pal[e]) * 16777619u;
+            for (; n < 256u; n++) pal[n] = pal[n & 15u];
+        }
+        const int redirect = gs_shadow_build(
+            tbp, tbw, tbp,
+            tbp + gs_page_span(&g, tbw, tw - 1u, th - 1u) * GS_PAGE_BYTES);
+        if (fast_ok) {
+            u64 k = texfast_mix(t0, clut);
+            k = texfast_mix(k, ((u64)lod << 48) ^ ((u64)tbw << 32) ^ tbp);
+            k = texfast_mix(k, ((u64)psm << 40) ^ ((u64)tw << 20) ^ th);
+            k = texfast_mix(k, hash);                       /* palette */
+            k = texfast_mix(k, gs_reg[GS_TEXA]);            /* 16/24-bit alpha expansion */
+            k = texfast_mix(k, tex_raw_hash(&g, tbp, ppr, tw, th, redirect));
+            fast_key = k | 1u;
+            fast_slot = (u32)(k >> 40) & (TEXFAST_N - 1u);
+            {
+                u64 skey = ((u64)tbp << 32) | ((u64)psm << 24) | ((u64)tw << 12) | th;
+                if (texfast[fast_slot].k == fast_key
+                    && ps2_vk_texture_is(texfast[fast_slot].idx, skey, texfast[fast_slot].shash)) {
+                    fast_idx = texfast[fast_slot].idx;
+                    hash = texfast[fast_slot].shash;
+                    ps2_vk_texture_touch(fast_idx);
+                    texcache_fast++;
+                }
+            }
+        }
+        if (fast_idx == 0xFFFFFFFFu) texcache_texels += (u64)tw * th;
+        for (y = 0; fast_idx == 0xFFFFFFFFu && y < th; y++) {
+            u8 *row = tex_scratch + (size_t)y * tw * 4u;
+            const u32 page_row = (y >> g.phsh) * ppr;
+            const u8 *blk_row = g.tab + (size_t)((y & g.phmask) >> g.bhsh)
+                                         * g.tabcols;
+            const u16 *off_row = g.off + ((y & g.bhmask) << g.bwsh);
+            const u64 row_bit = (u64)tbp * 8u + (u64)page_row * 65536u;
+            const u32 bits = g.bits;
+            const u8 *src = gs_vram;
+            x = 0;
+            while (x < tw) {
+                u64 blkbit = row_bit
+                        + (u64)(x >> g.pwsh) * 65536u
+                        + (u64)blk_row[(x & g.pwmask) >> g.bwsh] * 2048u;
+                u32 xb = x & g.bwmask;
+                u32 run = g.bw - xb;
+                u32 k;
+                u32 source_offset = 0;
+                if (redirect) {
+                    u32 pg = (u32)(blkbit >> 16);
+                    src = pg < GS_VRAM_PAGES ? gs_pagebase[pg] : gs_vram;
+                    source_offset = pg < GS_VRAM_PAGES
+                                  ? (u32)(blkbit >> 3) - pg * GS_PAGE_BYTES
+                                  : (u32)(blkbit >> 3);
+                    if (src != gs_vram) gs_shadow_runs++;
+                }
+                if (run > tw - x) run = tw - x;
+                if (psm == PSM_T8 || psm == PSM_T4) {
+                    const u32 base = (u32)(blkbit >> 3);
+                    u32 *dst = (u32 *)(row + x * 4u);
+                    const u16 *offsets = off_row + xb;
+                    if (base <= GS_VRAM_SIZE - 256u) {
+                        const u8 *block = src + (src != gs_vram ? source_offset : base);
+                        if (psm == PSM_T8) {
+                            for (k = 0; k + 4u <= run; k += 4u) {
+                                const u32 r0 = block[offsets[k] >> 3];
+                                const u32 r1 = block[offsets[k + 1u] >> 3];
+                                const u32 r2 = block[offsets[k + 2u] >> 3];
+                                const u32 r3 = block[offsets[k + 3u] >> 3];
+                                dst[k] = pal[r0];
+                                dst[k + 1u] = pal[r1];
+                                dst[k + 2u] = pal[r2];
+                                dst[k + 3u] = pal[r3];
+                                hash = (((hash << 13) | (hash >> 19))
+                                        ^ (r0 | (r1 << 8) | (r2 << 16) | (r3 << 24)))
+                                     * 0x9E3779B1u;
+                            }
+                            for (; k < run; k++) {
+                                const u32 raw = block[offsets[k] >> 3];
+                                dst[k] = pal[raw];
+                                hash = (hash ^ raw) * 16777619u;
+                            }
+                        } else {
+                            for (k = 0; k + 4u <= run; k += 4u) {
+                                const u32 b0 = offsets[k], b1 = offsets[k + 1u];
+                                const u32 b2 = offsets[k + 2u], b3 = offsets[k + 3u];
+                                const u32 r0 = (block[b0 >> 3] >> (b0 & 4u)) & 15u;
+                                const u32 r1 = (block[b1 >> 3] >> (b1 & 4u)) & 15u;
+                                const u32 r2 = (block[b2 >> 3] >> (b2 & 4u)) & 15u;
+                                const u32 r3 = (block[b3 >> 3] >> (b3 & 4u)) & 15u;
+                                dst[k] = pal[r0];
+                                dst[k + 1u] = pal[r1];
+                                dst[k + 2u] = pal[r2];
+                                dst[k + 3u] = pal[r3];
+                                hash = (((hash << 13) | (hash >> 19))
+                                        ^ (r0 | (r1 << 8) | (r2 << 16) | (r3 << 24)))
+                                     * 0x9E3779B1u;
+                            }
+                            for (; k < run; k++) {
+                                const u32 bit = offsets[k];
+                                const u32 raw = (block[bit >> 3] >> (bit & 4u)) & 15u;
+                                dst[k] = pal[raw];
+                                hash = (hash ^ raw) * 16777619u;
+                            }
+                        }
+                    } else {
+                        for (k = 0; k < run; k++) {
+                            dst[k] = pal[0];
+                            hash *= 16777619u;
+                        }
+                    }
+                    x += run;
+                    continue;
+                }
+                if (psm == 0u) {
+                    /* PSMCT32: one bounds check per 256-byte block instead of
+                       one per texel (movies upload and draw 32-bit frames) */
+                    const u32 base = (u32)(blkbit >> 3);
+                    if (base <= GS_VRAM_SIZE - 256u) {
+                        const u8 *block = src + (src != gs_vram ? source_offset : base);
+                        u32 *dst = (u32 *)(row + x * 4u);
+                        const u16 *offsets = off_row + xb;
+                        for (k = 0; k < run; k++) {
+                            u32 raw, a;
+                            memcpy(&raw, block + (offsets[k] >> 3), 4);
+                            a = raw >> 24;
+                            a = a >= 128u ? 255u : a * 2u;
+                            dst[k] = (raw & 0x00FFFFFFu) | (a << 24);
+                            hash = (hash ^ raw) * 16777619u;
+                        }
+                        x += run;
+                        continue;
+                    }
+                }
+                for (k = 0; k < run; k++) {
+                    u64 bit = blkbit + off_row[xb + k];
+                    u32 off = (u32)(bit >> 3), raw, out;
+                    u32 soff = src != gs_vram
+                             ? off - (u32)(blkbit >> 16) * GS_PAGE_BYTES : off;
+                    switch (bits) {
+                    case 4:
+                        raw = off < GS_VRAM_SIZE
+                            ? ((bit & 4u) ? (u32)(src[soff] >> 4)
+                                          : (u32)(src[soff] & 0xFu)) : 0u;
+                        break;
+                    case 8:
+                        raw = off < GS_VRAM_SIZE ? src[soff] : 0u;
+                        break;
+                    case 16:
+                        raw = off + 2u <= GS_VRAM_SIZE
+                            ? ((u32)src[soff] | ((u32)src[soff + 1] << 8)) : 0u;
+                        break;
+                    default: {
+                        u32 w32 = 0;
+                        if (off + 4u <= GS_VRAM_SIZE) memcpy(&w32, src + soff, 4);
+                        if (psm == PSM_T8H)       raw = (w32 >> 24) & 0xFFu;
+                        else if (psm == PSM_T4HL) raw = (w32 >> 24) & 0x0Fu;
+                        else if (psm == PSM_T4HH) raw = (w32 >> 28) & 0x0Fu;
+                        else                      raw = w32;
+                        break;
+                    }
+                    }
+                    out = indexed ? pal[raw & 0xFFu] : texel_rgba(raw, psm);
+                    memcpy(row + (x + k) * 4u, &out, 4);
+                    hash = (hash ^ raw) * 16777619u;
+                }
+                x += run;
+            }
+        }
+    }
+    key = ((u64)tbp << 32) | ((u64)psm << 24) | ((u64)tw << 12) | th;
+    {
+        const char *w = PS2_ENV("PS2_WATCH_VRAM") ? getenv("PS2_WATCH_VRAM") : NULL;
+        if (w) {
+            u32 want = (u32)strtoul(w, NULL, 0);
+            u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
+            if (cbp == want) {
+                u32 w0;
+                memcpy(&w0, gs_vram + cbp, 4);
+                ps2_log("watch: frame %llu  decode tbp=%u psm=%u %ux%u "
+                        "reads clut @%u = %08X",
+                        (unsigned long long)ps2_gs_frame_count, tbp, psm,
+                        tw, th, cbp, w0);
+            }
+        }
+    }
+    if (ps2_diag_armed) {
+        unsigned i;
+        u32 amax = 0, nz = 0;
+        for (i = 0; i < tw * th; i++) {
+            if (tex_scratch[i * 4 + 3] > amax) amax = tex_scratch[i * 4 + 3];
+            if (tex_scratch[i * 4] | tex_scratch[i * 4 + 1]
+                | tex_scratch[i * 4 + 2]) nz++;
+        }
+        for (i = 0; i < texc_n; i++)
+            if (texc[i].tbp == tbp && texc[i].psm == psm
+                && texc[i].tw == tw && texc[i].th == th) break;
+        if (i == texc_n && texc_n < TEXCENSUS_N) {
+            texc_n++;
+            texc[i].tbp = tbp; texc[i].tbw = tbw; texc[i].psm = psm;
+            texc[i].tw = tw; texc[i].th = th; texc[i].n = 0;
+            texc[i].cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
+            texc[i].amax_min = 255; texc[i].nz_max = 0;
+            if (PS2_ENV("PS2_TEX_DETAIL")) {
+                u32 amin = 255;
+                unsigned k;
+                for (k = 0; k < tw * th; k++)
+                    if (tex_scratch[k * 4 + 3] < amin) amin = tex_scratch[k * 4 + 3];
+                ps2_log("tex: tbp=%u tbw=%u psm=%u %ux%u  alpha %u..%u  "
+                        "non-black %u/%u | cbp=%u cpsm=%u csa=%u csm=%u cld=%u",
+                        tbp, tbw, psm, tw, th, amin, amax, nz, tw * th,
+                        texc[i].cbp,
+                        (u32)((t0 >> 51) & 0xFull), (u32)((t0 >> 56) & 0x1Full),
+                        (u32)((t0 >> 55) & 1ull), (u32)((t0 >> 61) & 7ull));
+                if (psm == PSM_T4 || psm == PSM_T8) {
+                    char l[2400];
+                    int ln = 0;
+                    unsigned n = psm == PSM_T4 ? 16u : 256u;
+                    for (k = 0; k < n; k++)
+                        ln += snprintf(l + ln, sizeof(l) - (size_t)ln, " %08X",
+                                       clut_entry(k));
+                    ps2_log("   clut:%s", l);
+                    ln = 0;
+                    for (k = 0; k < 32; k++)
+                        ln += snprintf(l + ln, sizeof(l) - (size_t)ln, "%X",
+                                       vram_get(tbp, tbw, k, 0, psm));
+                    ps2_log("   row0: %s", l);
+                    ln = 0;
+                    for (k = 0; k < 16 && texc[i].cbp + k * 4 + 4 <= GS_VRAM_SIZE; k++) {
+                        u32 w;
+                        memcpy(&w, gs_vram + texc[i].cbp + k * 4, 4);
+                        ln += snprintf(l + ln, sizeof(l) - (size_t)ln, " %08X", w);
+                    }
+                    ps2_log("   raw @%u:%s", texc[i].cbp, l);
+                }
+            }
+        }
+        if (i < texc_n) {
+            texc[i].n++;
+            if (amax < texc[i].amax_min) texc[i].amax_min = amax;
+            if (nz > texc[i].nz_max) texc[i].nz_max = nz;
+            if (amax > texc[i].amax_max) texc[i].amax_max = amax;
+        }
+    }
+    if (ps2_verbose) {
+        static u32 reported;
+        if (reported < 8) {
+            u32 amin = 255, amax = 0, nz = 0;
+            for (u32 i = 0; i < tw * th; i++) {
+                u32 a = tex_scratch[i * 4 + 3];
+                if (a < amin) amin = a;
+                if (a > amax) amax = a;
+                if (tex_scratch[i * 4] | tex_scratch[i * 4 + 1]
+                    | tex_scratch[i * 4 + 2]) nz++;
+            }
+            ps2_log("tex: tbp=%u tbw=%u psm=%u %ux%u  alpha %u..%u  "
+                    "non-black %u/%u  cbp=%u cpsm=%u csa=%u csm=%u cld=%u",
+                    tbp, tbw, psm, tw, th, amin, amax, nz, tw * th,
+                    (u32)((t0 >> 37) & 0x3FFFull) * 256u,
+                    (u32)((t0 >> 51) & 0x7ull), (u32)((t0 >> 56) & 0x1Full),
+                    (u32)((t0 >> 55) & 1ull), (u32)((t0 >> 61) & 7ull));
+            if (psm == PSM_T4 || psm == PSM_T8) {
+                char rl[300];
+                int rn = 0;
+                for (u32 e = 0; e < 32; e++)
+                    rn += snprintf(rl + rn, sizeof(rl) - (size_t)rn, "%X",
+                                   vram_get(tbp, tbw, e, 0, psm));
+                ps2_log("   row0: %s", rl);
+                rn = 0;
+                for (u32 e = 0; e < 32; e++)
+                    rn += snprintf(rl + rn, sizeof(rl) - (size_t)rn, "%X",
+                                   vram_get(tbp, tbw, e, 16, psm));
+                ps2_log("   row16:%s", rl);
+            }
+            if (psm == PSM_T4 || psm == PSM_T8) {
+                char l[300];
+                int ln = 0;
+                for (u32 e = 0; e < 16; e++)
+                    ln += snprintf(l + ln, sizeof(l) - (size_t)ln, " %08X",
+                                   clut_entry(e));
+                ps2_log("   clut:%s", l);
+            }
+            reported++;
+        }
+    }
+    if (ps2_diag_armed && PS2_ENV("PS2_DUMP_TEX")) {
+        static u64 dumped[256];
+        static unsigned ndumped;
+        u64 k = ((u64)tbp << 24) | ((u64)tw << 12) | th;
+        unsigned i;
+        static int nth = -1;
+        static u32 seen[256];
+        if (nth < 0) {
+            const char *e = getenv("PS2_DUMP_TEX_NTH");
+            nth = e ? (int)strtol(e, NULL, 0) : 1;
+            if (nth < 1) nth = 1;
+        }
+        for (i = 0; i < ndumped; i++) if (dumped[i] == k) break;
+        if (i == ndumped && ndumped < 256 && tw >= 32u) {
+            dumped[ndumped] = k;
+            seen[ndumped] = 0;
+            i = ndumped++;
+        }
+        if (i < ndumped) seen[i]++;
+        if (i < ndumped && seen[i] == (u32)nth) {
+            char nm[128];
+            FILE *fp;
+            snprintf(nm, sizeof nm, "ps2_tex_%u_%ux%u.ppm", tbp, tw, th);
+            fp = fopen(nm, "wb");
+            if (fp) {
+                u32 e;
+                fprintf(fp, "P6\n%u %u\n255\n", tw, th);
+                for (e = 0; e < tw * th; e++) {
+                    fputc(tex_scratch[e * 4 + 0], fp);
+                    fputc(tex_scratch[e * 4 + 1], fp);
+                    fputc(tex_scratch[e * 4 + 2], fp);
+                }
+                fclose(fp);
+                ps2_log("tex dump: %s (psm=%u tbw=%u cbp=%u)", nm, psm, tbw,
+                        (u32)((t0 >> 37) & 0x3FFFull) * 256u);
+            }
+            snprintf(nm, sizeof nm, "ps2_tex_%u_%ux%u_a.pgm", tbp, tw, th);
+            fp = fopen(nm, "wb");
+            if (fp) {
+                u32 e;
+                fprintf(fp, "P5\n%u %u\n255\n", tw, th);
+                for (e = 0; e < tw * th; e++) fputc(tex_scratch[e * 4 + 3], fp);
+                fclose(fp);
+            }
+        }
+    }
+    {
+        u32 idx = fast_idx != 0xFFFFFFFFu ? fast_idx
+                                          : ps2_vk_texture(key, hash, tex_scratch, tw, th);
+        /* Allocation failure is transient. Never memoize the invalid handle:
+           a later field may have freed an old display-list reference. */
+        if (idx == 0xFFFFFFFFu) return idx;
+        if (fast_ok && fast_idx == 0xFFFFFFFFu) {
+            texfast[fast_slot].k = fast_key;
+            texfast[fast_slot].idx = idx;
+            texfast[fast_slot].shash = hash;
+        }
+        {   /* PS2_DUMP_TEX_IDX=<n>: write each decode that lands in Vulkan slot n */
+            static int want = -2;
+            static unsigned nd;
+            if (want == -2) {
+                const char *e = getenv("PS2_DUMP_TEX_IDX");
+                want = e ? (int)strtol(e, NULL, 0) : -1;
+            }
+            if (want >= 0 && idx == (u32)want && nd < 16) {
+                char nm[128];
+                FILE *fp;
+                u32 e, amin = 255, amax = 0;
+                snprintf(nm, sizeof nm, "ps2_texidx_%u_%u.pam", idx, nd++);
+                fp = fopen(nm, "wb");
+                if (fp) {
+                    fprintf(fp, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\n"
+                                "TUPLTYPE RGB_ALPHA\nENDHDR\n", tw, th);
+                    fwrite(tex_scratch, 4, (size_t)tw * th, fp);
+                    fclose(fp);
+                }
+                for (e = 0; e < tw * th; e++) {
+                    if (tex_scratch[e * 4 + 3] < amin) amin = tex_scratch[e * 4 + 3];
+                    if (tex_scratch[e * 4 + 3] > amax) amax = tex_scratch[e * 4 + 3];
+                }
+                ps2_log("tex idx %u: %s tbp=%u tbw=%u psm=%u %ux%u cbp=%u cpsm=%u "
+                        "csm=%u csa=%u cld=%u texclut=%llX alpha %u..%u", idx, nm,
+                        tbp, tbw, psm, tw, th, (u32)((t0 >> 37) & 0x3FFFull) * 256u,
+                        (u32)((t0 >> 51) & 0xFull), (u32)((t0 >> 55) & 1ull),
+                        (u32)((t0 >> 56) & 0x1Full), (u32)((t0 >> 61) & 7ull),
+                        (unsigned long long)clut, amin, amax);
+            }
+        }
+        u32 slot = texcache_next++ % TEXCACHE_N;
+        gs_geom g;
+        u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
+        gs_psm_geom(psm, &g);
+        if (texcache[slot].used) {
+            u32 old_bucket = texcache_bucket(texcache[slot].t0,
+                texcache[slot].clut, texcache[slot].lod);
+            texmembers[old_bucket][slot / 64u] &= ~((u64)1 << (slot & 63u));
+        }
+        texmembers[texcache_bucket(t0, clut, lod)][slot / 64u] |= (u64)1 << (slot & 63u);
+        texcache[slot].used = 1;
+        texcache[slot].t0 = t0;
+        texcache[slot].clut = clut;
+        texcache[slot].lod = lod;
+        texcache[slot].tlo = tbp;
+        texcache[slot].tbw = tbw;
+        texcache[slot].thi = tbp + gs_page_span(&g, tbw, tw - 1u, th - 1u)
+                                 * GS_PAGE_BYTES;
+        texcache[slot].clo = cbp;
+        texcache[slot].chi = cbp + GS_PAGE_BYTES;
+        { u32 e = gs_content_epoch(tbp, tbw, texcache[slot].tlo,
+                                   texcache[slot].thi);
+          u32 c = gs_range_epoch(texcache[slot].clo, texcache[slot].chi);
+          texcache[slot].epoch = c > e ? c : e; }
+        texcache[slot].index = idx;
+        texcache[slot].skey = key;
+        texcache[slot].shash = hash;
+        texcache[slot].checked_seq = gs_validation_seq;
+        texcache[slot].w = *out_w;
+        texcache[slot].h = *out_h;
+        texidx[texcache_bucket(t0, clut, lod)] = (u16)(slot + 1u);
+        return idx;
+    }
+}
+
+static float z_norm(u32 z) {
+    u32 psm = (u32)((zbuf_reg() >> 24) & 0xFull);
+    double m = (psm == 1) ? 16777215.0 : (psm >= 2 ? 65535.0 : 4294967295.0);
+    double v = (double)z / m;
+    if (v > 1.0) v = 1.0;
+    if (v < 0.0) v = 0.0;
+    return (float)v;
+}
+
+#define GS_RT_SLOTS 32
+static u32 gs_rt_base[GS_RT_SLOTS];
+static u32 gs_rt_n;
+static u32 gs_rt_epoch[GS_RT_SLOTS];
+static u32 gs_rt_drawn[GS_RT_SLOTS];     /* primitives drawn into each target (overlay) */
+static u32 gs_rt_pages[GS_RT_SLOTS];
+static u32 gs_rt_fbw[GS_RT_SLOTS];      /* buffer width (pixels) of the last draw */
+static u8  gs_rt_psm[GS_RT_SLOTS];      /* frame format of the last draw */
+/* the epoch of the last draw that could write the target's alpha (FBMSK left
+   it open): PSMT8H data packed into the alpha bytes survives draws that mask
+   alpha, so only these make the render target the newer copy of it */
+static u32 gs_rt_aepoch[GS_RT_SLOTS];
+/* every alpha write into the target since it was last uploaded was also done
+   in VRAM (cpu_alpha_sprite): its alpha bytes there are exact, 0..255 */
+static u8  gs_rt_cpu_alpha[GS_RT_SLOTS];
+static u32 gs_rt_zbase[GS_RT_SLOTS];
+static u32 gs_rt_zepoch[GS_RT_SLOTS];
+static u8 gs_rt_zframe[GS_RT_SLOTS];
+static u32 gs_rt_field[GS_RT_SLOTS];
+static u32 gs_rt_field_pages[GS_RT_SLOTS];
+static u64 gs_rt_tex_draws, gs_rt_ztex_draws, gs_rt_tex_missed;
+static u32 gs_disp_base;
+u64 gs_guest_frames;
+
+static u32 rt_slot(u32 base) {
+    u32 i, victim = 0;
+    u32 oldest = 0xFFFFFFFFu;
+    int found = 0;
+    for (i = 0; i < gs_rt_n; i++) if (gs_rt_base[i] == base) return i;
+    if (gs_rt_n < GS_RT_SLOTS) {
+        gs_rt_base[gs_rt_n] = base;
+        gs_rt_pages[gs_rt_n] = 0;
+        gs_rt_zframe[gs_rt_n] = 0;
+        gs_rt_aepoch[gs_rt_n] = 0;
+        gs_rt_cpu_alpha[gs_rt_n] = 0;
+        return gs_rt_n++;
+    }
+    for (i = 0; i < gs_rt_n; i++) {
+        if (gs_rt_base[i] == gs_disp_base) continue;
+        if (!found || gs_rt_epoch[i] < oldest) {
+            oldest = gs_rt_epoch[i]; victim = i; found = 1;
+        }
+    }
+    if (!found) return 0;
+    {   static u32 said;
+        if (said++ < 4u)
+            ps2_log("gs: out of render-target slots (%u) -- recycling slot %u "
+                    "(fbp=%u, last drawn epoch %u) for fbp=%u",
+                    (unsigned)GS_RT_SLOTS, victim, gs_rt_base[victim], oldest,
+                    base);
+    }
+    gs_rt_base[victim] = base;
+    gs_rt_epoch[victim] = 0;
+    gs_rt_pages[victim] = 0;
+    gs_rt_zframe[victim] = 0;
+    gs_rt_aepoch[victim] = 0;
+    gs_rt_cpu_alpha[victim] = 0;
+    return victim;
+}
+
+static int rt_find(u32 base) {
+    u32 i;
+    for (i = 0; i < gs_rt_n; i++) if (gs_rt_base[i] == base) return (int)i;
+    return -1;
+}
+
+static u32 gs_range_epoch(u32 lo, u32 hi);
+static int psm_is_indexed(u32 psm);
+static int rt_covering(u32 addr) {
+    u32 i;
+    int best = -1;
+    for (i = 0; i < gs_rt_n; i++) {
+        u32 span = (gs_rt_pages[i] ? gs_rt_pages[i] : 1u) * GS_PAGE_BYTES;
+        if (!gs_rt_epoch[i] || addr < gs_rt_base[i] || addr >= gs_rt_base[i] + span)
+            continue;
+        if (best < 0 || gs_rt_epoch[i] > gs_rt_epoch[best]) best = (int)i;
+    }
+    return best;
+}
+/* A local->local copy that reads a render target newer than VRAM there: the
+   pixels are only on the GPU.  ps2_vk_rt_echo hands back what the GPU drew at
+   the same copy a field or two ago, written here into the source so the copy
+   moves them (AC4's cloud shadows baked into terrain tiles; without this, the
+   tiles kept stale VRAM and the ground near the coast turned black).
+   PS2_NO_RT_ECHO=1 copies VRAM as it is. */
+static void trx_local_echo(u32 sbp, u32 sbw, u32 spsm, u32 sx, u32 sy,
+                           u32 w, u32 h, u32 dbp, u32 dx, u32 dy) {
+    static int off = -1;
+    static u8 *px;
+    static size_t cap;
+    static u32 said;
+    int slot;
+    u32 rpsm, ep, hi, x, y;
+    u64 key;
+    gs_geom g;
+    if (off < 0) {
+        const char *e = getenv("PS2_NO_RT_ECHO");
+        off = (e && *e && *e != '0') ? 1 : 0;
+        if (off) ps2_log("GS: copies from render targets read VRAM as it is (PS2_NO_RT_ECHO)");
+    }
+    if (off || !ps2_vk_enabled() || !w || !h || w * h > 256u * 256u) return;
+    slot = rt_covering(sbp);
+    if (slot < 0 || gs_rt_base[slot] != sbp || gs_rt_fbw[slot] != sbw) return;
+    rpsm = gs_rt_psm[slot];
+    if (rpsm != PSM_CT32 && rpsm != PSM_CT24) return;
+    if (spsm != PSM_CT32 && spsm != PSM_CT24 && spsm != PSM_T8H
+        && spsm != PSM_T4HL && spsm != PSM_T4HH) return;
+    /* indices in alpha bytes that cpu_alpha_sprite kept exact in VRAM */
+    if (spsm != PSM_CT32 && spsm != PSM_CT24 && gs_rt_cpu_alpha[slot]) return;
+    /* PSMT8H/T4H data lives in the alpha bytes: only draws that wrote alpha
+       made the target the newer copy (as for textures in fill_state) */
+    ep = spsm == PSM_CT32 || spsm == PSM_CT24 ? gs_rt_epoch[slot] : gs_rt_aepoch[slot];
+    gs_psm_geom(rpsm, &g);
+    hi = sbp + gs_page_span(&g, sbw, sx + w - 1u, sy + h - 1u) * GS_PAGE_BYTES;
+    if (!ep || gs_range_epoch(sbp, hi) > ep) return;
+    key = ((u64)sbp << 40) ^ ((u64)dbp << 16) ^ ((u64)sx << 52) ^ ((u64)sy << 58)
+        ^ ((u64)dx << 4) ^ (u64)dy ^ ((u64)w << 28) ^ ((u64)h << 34);
+    if ((size_t)w * h * 4u > cap) {
+        u8 *n = (u8 *)realloc(px, (size_t)w * h * 4u);
+        if (!n) return;
+        px = n;
+        cap = (size_t)w * h * 4u;
+    }
+    if (!ps2_vk_rt_echo(key, (u32)slot, sx, sy, w, h, px)) {
+        if (said++ < 4u)
+            ps2_log("gs: copy from render target %d (fbp=%u) to %u (%u,%u) %ux%u -- "
+                    "its pixels arrive from the GPU in a field or two",
+                    slot, sbp, dbp, dx, dy, w, h);
+        return;
+    }
+    if (getenv("PS2_ECHO_DUMP")) {   /* debugging: what the echo brings, per copy */
+        static u32 nd;
+        char nm[96];
+        FILE *f;
+        snprintf(nm, sizeof nm, "echo_%03u_%u_%u_%u.pam", nd++, dbp, dx, dy);
+        if ((f = fopen(nm, "wb")) != NULL) {
+            fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", w, h);
+            fwrite(px, 1, (size_t)w * h * 4u, f);
+            fclose(f);
+        }
+        {   /* PS2_ECHO_DUMP=<addr>: also that buffer's PSMT8H bytes (width w) */
+            u32 a = (u32)strtoul(getenv("PS2_ECHO_DUMP"), NULL, 0);
+            snprintf(nm, sizeof nm, "echo_%03u_base.pgm", nd - 1u);
+            if (a && (f = fopen(nm, "wb")) != NULL) {
+                fprintf(f, "P5\n%u %u\n255\n", w, h);
+                for (y = 0; y < h; y++)
+                    for (x = 0; x < w; x++) fputc((int)vram_get(a, w, x, y, PSM_T8H), f);
+                fclose(f);
+            }
+        }
+    }
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            const u8 *p = px + ((size_t)y * w + x) * 4u;
+            vram_put(sbp, sbw, sx + x, sy + y, rpsm,
+                     (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24));
+        }
+}
+
+static void clut_rt_probe(u64 t0, u32 draw_rt) {
+    static struct { u32 tbp, cbp, psm, tw, th, fbp, cs, which, stale; u64 n; } seen[128];
+    static unsigned n_seen;
+    u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
+    u32 psm = (u32)((t0 >> 20) & 0x3Full);
+    u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
+    u32 tw = 1u << ((t0 >> 26) & 0xFull), th = 1u << ((t0 >> 30) & 0xFull);
+    u32 cs = (u32)((t0 >> 51) & 0x1Full);
+    u32 which = 0, stale = 0, fbp = draw_rt < GS_RT_SLOTS ? gs_rt_base[draw_rt] : 0;
+    int s;
+    unsigned i;
+    if (psm_is_indexed(psm)) {
+        s = rt_covering(cbp);
+        if (s >= 0) {
+            which |= 1u;
+            if (gs_range_epoch(cbp, cbp + 1u) <= gs_rt_epoch[s]) stale |= 1u;
+        }
+    }
+    s = rt_covering(tbp);
+    if (s >= 0) {
+        which |= 2u;
+        if (gs_range_epoch(tbp, tbp + 1u) <= gs_rt_epoch[s]) stale |= 2u;
+    }
+    if (!which) return;
+    for (i = 0; i < n_seen; i++)
+        if (seen[i].tbp == tbp && seen[i].cbp == cbp && seen[i].psm == psm
+            && seen[i].tw == tw && seen[i].th == th && seen[i].fbp == fbp
+            && seen[i].cs == cs && seen[i].which == which && seen[i].stale == stale) {
+            seen[i].n++;
+            if ((seen[i].n & (seen[i].n - 1)) == 0)
+                ps2_log("clut-rt: x%llu frame %llu tbp=%u psm=%u %ux%u cbp=%u cs=%X "
+                        "into fbp=%u  %s%s stale=%u",
+                        (unsigned long long)seen[i].n,
+                        (unsigned long long)ps2_gs_frame_count, tbp, psm, tw, th,
+                        cbp, cs, fbp, which & 1u ? "[clut in rt]" : "",
+                        which & 2u ? "[index in rt]" : "", stale);
+            return;
+        }
+    if (n_seen < 128u) {
+        i = n_seen++;
+        seen[i].tbp = tbp; seen[i].cbp = cbp; seen[i].psm = psm; seen[i].tw = tw;
+        seen[i].th = th; seen[i].fbp = fbp; seen[i].cs = cs; seen[i].which = which;
+        seen[i].stale = stale; seen[i].n = 1;
+    }
+    ps2_log("clut-rt: NEW frame %llu tbp=%u psm=%u %ux%u cbp=%u cs=%X into fbp=%u  "
+            "%s%s stale=%u",
+            (unsigned long long)ps2_gs_frame_count, tbp, psm, tw, th, cbp, cs, fbp,
+            which & 1u ? "[clut in rt]" : "", which & 2u ? "[index in rt]" : "", stale);
+}
+
+static int rt_find_z(u32 base) {
+    u32 i;
+    int best = -1;
+    u32 newest = 0;
+    for (i = 0; i < gs_rt_n; i++) {
+        if (gs_rt_zbase[i] != base || !gs_rt_zepoch[i]) continue;
+        if (best < 0 || gs_rt_zepoch[i] >= newest) {
+            newest = gs_rt_zepoch[i]; best = (int)i;
+        }
+    }
+    return best;
+}
+
+static int psm_is_z(u32 psm) {
+    return psm == PSM_Z32 || psm == PSM_Z24
+        || psm == PSM_Z16 || psm == PSM_Z16S;
+}
+
+/* Pixel position, inside render target `slot`, of the PSMCT32 block at `addr`. */
+static int rt_addr_xy(int slot, u32 addr, u32 *xy) {
+    static const u8 blk32[4][8] = {
+        { 0, 1, 4, 5, 16, 17, 20, 21 }, { 2, 3, 6, 7, 18, 19, 22, 23 },
+        { 8, 9, 12, 13, 24, 25, 28, 29 }, { 10, 11, 14, 15, 26, 27, 30, 31 } };
+    u32 w = gs_rt_fbw[slot], off, ppr, page, blk, bx, by, x, y;
+    /* the block layout below is PSMCT32's (PSMCT24 shares it) */
+    if (gs_rt_psm[slot] != PSM_CT32 && gs_rt_psm[slot] != PSM_CT24) return 0;
+    if (!w || addr < gs_rt_base[slot]) return 0;
+    off = addr - gs_rt_base[slot];
+    ppr = w / 64u ? w / 64u : 1u;
+    page = off / GS_PAGE_BYTES;
+    blk = (off % GS_PAGE_BYTES) / 256u;
+    for (by = 0; by < 4u; by++)
+        for (bx = 0; bx < 8u; bx++)
+            if (blk32[by][bx] == blk) goto found;
+    return 0;
+found:
+    x = (page % ppr) * 64u + bx * 8u;
+    y = (page / ppr) * 32u + by * 8u;
+    if (x > 0xFFFFu || y > 0xFFFFu) return 0;
+    *xy = x | (y << 16);
+    return 1;
+}
+
+static int psm_is_indexed(u32 psm) {
+    return psm == PSM_T8 || psm == PSM_T4
+        || psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH;
+}
+
+static u32 tex_reach(u32 mode, u32 minc, u32 maxc, u32 declared) {
+    u32 reach;
+    switch (mode) {
+    case 2:  reach = maxc + 1u; break;
+    case 3:  reach = (minc | maxc) + 1u; break;
+    default: return declared;
+    }
+    if (!reach || reach > declared) return declared;
+    return reach;
+}
+
+void ps2_gs_deinterlace(int off) { no_deinterlace = off; }
+
+void ps2_gs_priv_cap_save(u64 *priv, u64 *csr, u64 *imr);
+void ps2_gs_priv_cap_load(const u64 *priv, u64 csr, u64 imr);
+
+_Static_assert(GS_VRAM_PAGES == PS2_CAP_GS_PAGES,
+               "ps2_gs_capstate's page tables no longer match GS_VRAM_PAGES");
+_Static_assert(GS_RT_SLOTS == (int)PS2_CAP_RT_SLOTS,
+               "ps2_gs_capstate's render-target tables no longer match "
+               "GS_RT_SLOTS");
+
+void ps2_gs_cap_save(ps2_gs_capstate *st) {
+    memset(st, 0, sizeof *st);
+    memcpy(st->reg, gs_reg, sizeof gs_reg);
+    ps2_gs_priv_cap_save(st->priv, &st->csr, &st->imr);
+    memcpy(st->rt_base,   gs_rt_base,   sizeof st->rt_base);
+    memcpy(st->rt_epoch,  gs_rt_epoch,  sizeof st->rt_epoch);
+    memcpy(st->rt_pages,  gs_rt_pages,  sizeof st->rt_pages);
+    memcpy(st->rt_zbase,  gs_rt_zbase,  sizeof st->rt_zbase);
+    memcpy(st->rt_zepoch, gs_rt_zepoch, sizeof st->rt_zepoch);
+    st->rt_n = gs_rt_n;
+    st->disp_base = gs_disp_base;
+    st->epoch_seq = gs_epoch_seq;
+    st->frame_count = ps2_gs_frame_count;
+    memcpy(st->page_epoch,     gs_page_epoch,     sizeof st->page_epoch);
+    memcpy(st->page_owner,     gs_page_owner,     sizeof st->page_owner);
+    memcpy(st->page_owner_bw,  gs_page_owner_bw,  sizeof st->page_owner_bw);
+    memcpy(st->page_owner_psm, gs_page_owner_psm, sizeof st->page_owner_psm);
+}
+
+void ps2_gs_cap_load(const ps2_gs_capstate *st) {
+    u32 r;
+    ps2_gs_priv_cap_load(st->priv, st->csr, st->imr);
+    for (r = 0; r < 0x64; r++) {
+        switch (r) {
+        case GS_XYZF2: case GS_XYZ2: case GS_XYZF3: case GS_XYZ3:
+        case GS_TRXDIR: case GS_HWREG:
+            gs_reg[r] = st->reg[r];
+            break;
+        default:
+            ps2_gs_write_reg(r, st->reg[r]);
+            break;
+        }
+    }
+    gs_qn = 0;
+    gs_strip_parity = 0;
+    memcpy(gs_rt_base,   st->rt_base,   sizeof gs_rt_base);
+    memcpy(gs_rt_epoch,  st->rt_epoch,  sizeof gs_rt_epoch);
+    memcpy(gs_rt_pages,  st->rt_pages,  sizeof gs_rt_pages);
+    memcpy(gs_rt_zbase,  st->rt_zbase,  sizeof gs_rt_zbase);
+    memcpy(gs_rt_zepoch, st->rt_zepoch, sizeof gs_rt_zepoch);
+    memset(gs_rt_zframe, 0, sizeof gs_rt_zframe);
+    memset(gs_rt_aepoch, 0, sizeof gs_rt_aepoch);
+    gs_rt_n = st->rt_n < GS_RT_SLOTS ? st->rt_n : GS_RT_SLOTS;
+    gs_disp_base = st->disp_base;
+    gs_epoch_seq = st->epoch_seq;
+    ++gs_validation_seq;
+    memset(texcache, 0, sizeof texcache);
+    memset(texmembers, 0, sizeof texmembers);
+    memset(texidx, 0, sizeof texidx);
+    ps2_gs_frame_count = st->frame_count;
+    memcpy(gs_page_epoch,     st->page_epoch,     sizeof gs_page_epoch);
+    memcpy(gs_page_owner,     st->page_owner,     sizeof gs_page_owner);
+    memcpy(gs_page_owner_bw,  st->page_owner_bw,  sizeof gs_page_owner_bw);
+    memcpy(gs_page_owner_psm, st->page_owner_psm, sizeof gs_page_owner_psm);
+    gs_state_ver++;
+}
+
+u8 *ps2_gs_vram_ptr(u32 *size) {
+    if (size) *size = (u32)GS_VRAM_SIZE;
+    return gs_vram;
+}
+
+static const char *ps2_gs_reg_name(u32 r) {
+    switch (r) {
+    case GS_PRIM:        return "PRIM";
+    case GS_RGBAQ:       return "RGBAQ";
+    case GS_ST:          return "ST";
+    case GS_UV:          return "UV";
+    case GS_XYZF2:       return "XYZF2";
+    case GS_XYZ2:        return "XYZ2";
+    case GS_TEX0_1:      return "TEX0_1";
+    case GS_TEX0_2:      return "TEX0_2";
+    case GS_CLAMP_1:     return "CLAMP_1";
+    case GS_CLAMP_2:     return "CLAMP_2";
+    case GS_FOG:         return "FOG";
+    case GS_XYZF3:       return "XYZF3";
+    case GS_XYZ3:        return "XYZ3";
+    case GS_TEX1_1:      return "TEX1_1";
+    case GS_TEX1_2:      return "TEX1_2";
+    case GS_TEX2_1:      return "TEX2_1";
+    case GS_TEX2_2:      return "TEX2_2";
+    case GS_XYOFFSET_1:  return "XYOFFSET_1";
+    case GS_XYOFFSET_2:  return "XYOFFSET_2";
+    case GS_PRMODECONT:  return "PRMODECONT";
+    case GS_PRMODE:      return "PRMODE";
+    case GS_TEXCLUT:     return "TEXCLUT";
+    case GS_SCANMSK:     return "SCANMSK";
+    case GS_MIPTBP1_1:   return "MIPTBP1_1";
+    case GS_MIPTBP1_2:   return "MIPTBP1_2";
+    case GS_MIPTBP2_1:   return "MIPTBP2_1";
+    case GS_MIPTBP2_2:   return "MIPTBP2_2";
+    case GS_TEXA:        return "TEXA";
+    case GS_FOGCOL:      return "FOGCOL";
+    case GS_TEXFLUSH:    return "TEXFLUSH";
+    case GS_SCISSOR_1:   return "SCISSOR_1";
+    case GS_SCISSOR_2:   return "SCISSOR_2";
+    case GS_ALPHA_1:     return "ALPHA_1";
+    case GS_ALPHA_2:     return "ALPHA_2";
+    case GS_DIMX:        return "DIMX";
+    case GS_DTHE:        return "DTHE";
+    case GS_COLCLAMP:    return "COLCLAMP";
+    case GS_TEST_1:      return "TEST_1";
+    case GS_TEST_2:      return "TEST_2";
+    case GS_PABE:        return "PABE";
+    case GS_FBA_1:       return "FBA_1";
+    case GS_FBA_2:       return "FBA_2";
+    case GS_FRAME_1:     return "FRAME_1";
+    case GS_FRAME_2:     return "FRAME_2";
+    case GS_ZBUF_1:      return "ZBUF_1";
+    case GS_ZBUF_2:      return "ZBUF_2";
+    case GS_BITBLTBUF:   return "BITBLTBUF";
+    case GS_TRXPOS:      return "TRXPOS";
+    case GS_TRXREG:      return "TRXREG";
+    case GS_TRXDIR:      return "TRXDIR";
+    case GS_HWREG:       return "HWREG";
+    case GS_SIGNAL:      return "SIGNAL";
+    case GS_FINISH:      return "FINISH";
+    case GS_LABEL:       return "LABEL";
+    default:             return "?";
+    }
+}
+
+void ps2_vk_statecap(const char *dir);
+
+void ps2_gs_statecap(const char *dir) {
+    char p[400];
+    FILE *f;
+    u32 i;
+
+    snprintf(p, sizeof p, "%s/gs.txt", dir);
+    f = fopen(p, "w");
+    if (f) {
+        u64 fb = dispfb_reg(), d = display_reg();
+        fprintf(f,
+            "# GS state at the frame after the snapshot was asked for.\n"
+            "# Local memory is beside this as gs_vram.bin (%u KB, in the\n"
+            "# hardware's page/block/column layout -- decode it with the\n"
+            "# same (base,bw,x,y,psm) arithmetic vram_get uses).\n\n",
+            (u32)(GS_VRAM_SIZE / 1024));
+        fprintf(f, "frame %llu   %llu prims, %llu pixels, %llu register writes\n",
+                (unsigned long long)ps2_gs_frame_count,
+                (unsigned long long)gs_stat_prims,
+                (unsigned long long)gs_stat_pixels,
+                (unsigned long long)gs_stat_regs);
+        fprintf(f, "transfers %llu (%llu pixels)\n\n",
+                (unsigned long long)gs_stat_trx,
+                (unsigned long long)gs_stat_trxpix);
+
+        fprintf(f, "== display ==\n");
+        fprintf(f, "  PMODE=%016llX  circuit %d\n",
+                (unsigned long long)ps2_gs_priv_read(0x12000000u),
+                (ps2_gs_priv_read(0x12000000u) & 2ull) ? 2 : 1);
+        fprintf(f, "  DISPFB=%016llX base=%u fbw=%u psm=%u dbx=%u dby=%u\n",
+                (unsigned long long)fb, (u32)(fb & 0x1FFull) * 2048u * 4u,
+                (u32)((fb >> 9) & 0x3Full) * 64u, (u32)((fb >> 15) & 0x1Full),
+                (u32)((fb >> 32) & 0x7FFull), (u32)((fb >> 43) & 0x7FFull));
+        fprintf(f, "  DISPLAY=%016llX shown %ux%u\n",
+                (unsigned long long)d, ps2_gs_display_width(),
+                ps2_gs_display_height());
+        fprintf(f, "  DISPFB1=%016llX DISPFB2=%016llX\n\n",
+                (unsigned long long)ps2_gs_priv_read(0x12000070u),
+                (unsigned long long)ps2_gs_priv_read(0x12000090u));
+
+        fprintf(f, "== render targets (%u) ==\n", gs_rt_n);
+        for (i = 0; i < gs_rt_n; i++)
+            fprintf(f, "  slot %-2u base %u%s\n", i, gs_rt_base[i],
+                    gs_rt_base[i] == gs_disp_base ? "   <- displayed" : "");
+
+        fprintf(f, "\n== register file (the words a draw would use now) ==\n");
+        for (i = 0; i < 0x64; i++)
+            if (gs_reg[i] || gs_reg_hist[i])
+                fprintf(f, "  %02X %-14s = %016llX   (%llu writes)\n", i,
+                        ps2_gs_reg_name(i), (unsigned long long)gs_reg[i],
+                        (unsigned long long)gs_reg_hist[i]);
+        fclose(f);
+    }
+
+    if (gs_vram) {
+        snprintf(p, sizeof p, "%s/gs_vram.bin", dir);
+        f = fopen(p, "wb");
+        if (f) { fwrite(gs_vram, 1, GS_VRAM_SIZE, f); fclose(f); }
+    }
+
+    ps2_vk_statecap(dir);
+
+    snprintf(p, sizeof p, "%s/capture.gscap", dir);
+    ps2_cap_request(p, 2);
+}
+
+void ps2_gs_state_save(ps2_state_put put, void *ud) {
+    put(ud, "gs_vram", gs_vram, gs_vram ? (u64)GS_VRAM_SIZE : 0u);
+    put(ud, "gs_reg", gs_reg, sizeof gs_reg);
+    put(ud, "gs_rtbase", gs_rt_base, sizeof gs_rt_base);
+    put(ud, "gs_rtepoch", gs_rt_epoch, sizeof gs_rt_epoch);
+    put(ud, "gs_pgepoch", gs_page_epoch, sizeof gs_page_epoch);
+}
+
+static u64 gs_fb_date, gs_fb_alpha_c_ad, gs_fb_alpha_cd, gs_fb_fba;
+static u64 gs_fb_colclamp_wrap, gs_fb_pabe, gs_fb_blended;
+static struct { u32 key; u64 n; } gs_cc_eq[64];
+static u32 gs_cc_eq_n;
+
+void ps2_gs_rt_report(void) {
+    u32 i;
+    char line[256] = {0};
+    int n = 0;
+    for (i = 0; i < gs_rt_n; i++)
+        n += snprintf(line + n, sizeof line - (size_t)n, " %u", gs_rt_base[i]);
+    ps2_log("GS render targets (%u):%s   %llu draws sampled one, %llu fell "
+            "back to local memory", gs_rt_n, line,
+            (unsigned long long)gs_rt_tex_draws,
+            (unsigned long long)gs_rt_tex_missed);
+    {
+        char zl[256] = {0};
+        int zn = 0;
+        u32 k;
+        for (k = 0; k < gs_rt_n; k++) {
+            if (zn >= (int)sizeof zl - 20) break;
+            if (gs_rt_zepoch[k])
+                zn += snprintf(zl + zn, sizeof zl - (size_t)zn, " %u(slot %u)",
+                               gs_rt_zbase[k], k);
+        }
+        zl[zn] = 0;
+        ps2_log("GS depth buffers:%s   %llu draws sampled one as a texture",
+                zn ? zl : " none", (unsigned long long)gs_rt_ztex_draws);
+    }
+    ps2_log("GS destination-alpha draw states: DATE %llu, blend C=Ad %llu, "
+            "blend term Cd %llu, FBA %llu",
+            (unsigned long long)gs_fb_date,
+            (unsigned long long)gs_fb_alpha_c_ad,
+            (unsigned long long)gs_fb_alpha_cd,
+            (unsigned long long)gs_fb_fba);
+    ps2_log("GS blend modifiers the renderer ignores: of %llu blended draws, "
+            "%llu had COLCLAMP=0 (blend result wraps at 8 bits instead of "
+            "clamping) and %llu had PABE=1 (blend only where source alpha's "
+            "MSB is set).  Both are currently always-clamp, always-blend.",
+            (unsigned long long)gs_fb_blended,
+            (unsigned long long)gs_fb_colclamp_wrap,
+            (unsigned long long)gs_fb_pabe);
+    {   static const char *src[4] = { "Cs", "Cd", "0", "?" };
+        static const char *cf[4]  = { "As", "Ad", "FIX", "?" };
+        u32 j, k;
+        for (j = 0; j < gs_cc_eq_n; j++)
+            for (k = j + 1; k < gs_cc_eq_n; k++)
+                if (gs_cc_eq[k].n > gs_cc_eq[j].n) {
+                    typeof(gs_cc_eq[0]) t = gs_cc_eq[j];
+                    gs_cc_eq[j] = gs_cc_eq[k]; gs_cc_eq[k] = t;
+                }
+        ps2_log("GS COLCLAMP=0 blend equations (%u distinct), (A-B)*C>>7+D -- "
+                "A==B means the result is just D and wrap cannot differ from "
+                "clamp:", gs_cc_eq_n);
+        for (j = 0; j < gs_cc_eq_n && j < 12u; j++) {
+            u32 K = gs_cc_eq[j].key;
+            ps2_log("   (%s-%s)*%s>>7+%s  %12llu draws%s",
+                    src[K & 3u], src[(K >> 2) & 3u], cf[(K >> 4) & 3u],
+                    src[(K >> 6) & 3u], (unsigned long long)gs_cc_eq[j].n,
+                    ((K & 3u) == ((K >> 2) & 3u)) ? "   [A==B: wrap == clamp]"
+                                                  : "");
+        }
+    }
+    ps2_log("GS field blits deinterlaced: %llu",
+            (unsigned long long)gs_stat_deint);
+    if (gs_stat_ws_hud)
+        ps2_log("GS widescreen: %llu 2D primitives kept 4:3, %llu lock cues left on their "
+                "target", (unsigned long long)gs_stat_ws_hud, (unsigned long long)gs_stat_ws_cue);
+    ps2_log("GS DISPFB base %u -> slot %d,  PMODE %llX  DISPFB1 %llX DISPFB2 %llX",
+            gs_disp_base, rt_find(gs_disp_base),
+            (unsigned long long)ps2_gs_priv_read(0x12000000u),
+            (unsigned long long)ps2_gs_priv_read(0x12000070u),
+            (unsigned long long)ps2_gs_priv_read(0x12000090u));
+}
+
+static void fill_state_count(const ps2_vk_state *st) {
+    if (st->date)          gs_fb_date++;
+    if (st->abe) {
+        if (st->alpha_c == 1u) gs_fb_alpha_c_ad++;
+        if (st->alpha_a == 1u || st->alpha_b == 1u || st->alpha_d == 1u)
+            gs_fb_alpha_cd++;
+    }
+    if (st->fba)           gs_fb_fba++;
+    if (st->abe) {
+        gs_fb_blended++;
+        if (!(gs_reg[GS_COLCLAMP] & 1ull)) {
+            u32 key = st->alpha_a | (st->alpha_b << 2) | (st->alpha_c << 4)
+                    | (st->alpha_d << 6);
+            u32 j;
+            gs_fb_colclamp_wrap++;
+            for (j = 0; j < gs_cc_eq_n; j++)
+                if (gs_cc_eq[j].key == key) break;
+            if (j == gs_cc_eq_n && gs_cc_eq_n < 64u) {
+                gs_cc_eq_n++;
+                gs_cc_eq[j].key = key;
+                gs_cc_eq[j].n = 0;
+            }
+            if (j < gs_cc_eq_n) gs_cc_eq[j].n++;
+        }
+        if (gs_reg[GS_PABE] & 1ull)        gs_fb_pabe++;
+    }
+}
+
+static int fill_no_memo;
+static struct {
+    int valid;
+    u64 ver, validation_seq;
+    u32 prim, epoch_seq, frame, disp_base;
+    int dyn_lod;
+    u32 dyn_mip;
+    u8 tex_hit, rt_tex_draw, rt_tex_missed, rt_ztex_draw;
+    ps2_vk_state st;
+} fs_memo;
+
+static const u8 gs_reg_is_data[0x64] = {
+    [0x01] = 1, [0x02] = 1, [0x03] = 1, [0x04] = 1, [0x05] = 1, [0x0A] = 1,
+    [0x0C] = 1, [0x0D] = 1, [0x50] = 1, [0x51] = 1, [0x52] = 1, [0x53] = 1,
+    [0x54] = 1, [0x60] = 1, [0x61] = 1, [0x62] = 1,
+};
+
+static void fill_state_compute(ps2_vk_state *st);
+static void fill_state(ps2_vk_state *st) {
+    static int memo_on = -1;
+    u64 h0, rtd0, rtm0, rtz0;
+    if (PS2_UNLIKELY(memo_on < 0)) {
+        const char *e = getenv("PS2_GS_STATE_MEMO");
+        memo_on = !(e && *e == '0') && !getenv("PS2_CLUT_RT");
+        if (!memo_on) ps2_log("GS: draw state worked out for every primitive "
+                              "(PS2_GS_STATE_MEMO=0 or PS2_CLUT_RT)");
+    }
+    if (memo_on && fs_memo.valid && fs_memo.ver == gs_state_ver
+        && fs_memo.prim == gs_prim && fs_memo.epoch_seq == gs_epoch_seq
+        && fs_memo.validation_seq == gs_validation_seq
+        && fs_memo.frame == ps2_gs_frame_count
+        && fs_memo.disp_base == gs_disp_base
+        && fs_memo.dyn_lod == gs_dyn_lod && fs_memo.dyn_mip == gs_dyn_mip) {
+        *st = fs_memo.st;
+        fill_state_count(st);
+        texcache_hits += fs_memo.tex_hit;
+        gs_rt_tex_draws += fs_memo.rt_tex_draw;
+        gs_rt_tex_missed += fs_memo.rt_tex_missed;
+        gs_rt_ztex_draws += fs_memo.rt_ztex_draw;
+        fs_memo_hits++;
+        return;
+    }
+    h0 = texcache_hits + texcache_misses;
+    rtd0 = gs_rt_tex_draws; rtm0 = gs_rt_tex_missed; rtz0 = gs_rt_ztex_draws;
+    fill_no_memo = 0;
+    fill_state_compute(st);
+    fs_memo_misses++;
+    if (!memo_on) return;
+    fs_memo.valid = !fill_no_memo;
+    fs_memo.ver = gs_state_ver;
+    fs_memo.prim = gs_prim;
+    fs_memo.epoch_seq = gs_epoch_seq;
+    fs_memo.validation_seq = gs_validation_seq;
+    fs_memo.frame = ps2_gs_frame_count;
+    fs_memo.disp_base = gs_disp_base;
+    fs_memo.dyn_lod = gs_dyn_lod;
+    fs_memo.dyn_mip = gs_dyn_mip;
+    fs_memo.tex_hit = (u8)(texcache_hits + texcache_misses != h0);
+    fs_memo.rt_tex_draw = (u8)(gs_rt_tex_draws - rtd0);
+    fs_memo.rt_tex_missed = (u8)(gs_rt_tex_missed - rtm0);
+    fs_memo.rt_ztex_draw = (u8)(gs_rt_ztex_draws - rtz0);
+    fs_memo.st = *st;
+}
+
+static void fill_state_compute(ps2_vk_state *st) {
+    u64 tst = test_reg(), sc = scissor_reg(), al = alpha_reg(), t0 = tex0_reg();
+    u64 cl = clamp_reg();
+    memset(st, 0, sizeof(*st));
+    st->fb_mask = fb_mask();
+    st->fb_w = fb_width() ? fb_width() : 640u;
+    st->fb_h = (u32)((sc >> 48) & 0x7FFull) + 1u;
+    if (st->fb_h < 16u) st->fb_h = 448u;
+    st->fb_psm = fb_psm();
+    st->scissor[0] = (s32)(sc & 0x7FFull);
+    st->scissor[1] = (s32)((sc >> 16) & 0x7FFull);
+    st->scissor[2] = (s32)((sc >> 32) & 0x7FFull);
+    st->scissor[3] = (s32)((sc >> 48) & 0x7FFull);
+    st->ztst = (u32)((tst >> 17) & 3ull);
+    st->zwrite = zb_enabled() ? 1 : 0;
+    st->abe = (gs_prim & PRIM_ABE) ? 1 : 0;
+    {   static int off = -1;
+        if (off < 0) {
+            const char *e = getenv("PS2_NO_COLCLIP");
+            off = (e && *e && *e != '0') ? 1 : 0;
+            if (off) ps2_log("GS: wrapping blends clamp instead (PS2_NO_COLCLIP)");
+        }
+        st->colclip = !off && st->abe && !(gs_reg[GS_COLCLAMP] & 1ull);
+    }
+    st->alpha_a = (u32)(al & 3ull);
+    st->alpha_b = (u32)((al >> 2) & 3ull);
+    st->alpha_c = (u32)((al >> 4) & 3ull);
+    st->alpha_d = (u32)((al >> 6) & 3ull);
+    st->alpha_fix = (u32)((al >> 32) & 0xFFull);
+    st->ate = (u32)(tst & 1ull) ? 1 : 0;
+    st->atst = (u32)((tst >> 1) & 7ull);
+    st->aref = (u32)((tst >> 4) & 0xFFull);
+    st->afail = (u32)((tst >> 12) & 3ull);
+    st->zte = (u32)((tst >> 16) & 1ull) ? 1 : 0;
+    st->fge = (gs_prim & (1u << 5)) ? 1 : 0;
+    st->fogcol = (u32)(gs_reg[GS_FOGCOL] & 0xFFFFFFull);
+    st->fba = (u32)(gs_reg[ctx_of() ? GS_FBA_2 : GS_FBA_1] & 1ull) ? 1 : 0;
+    {   static int off = -1;
+        if (off < 0) {
+            const char *e = getenv("PS2_NO_DATE");
+            off = (e && *e && *e != '0') ? 1 : 0;
+            if (off) ps2_log("GS: destination alpha test disabled (PS2_NO_DATE)");
+        }
+        st->date = !off && ((tst >> 14) & 1ull) ? 1 : 0;
+    }
+    st->datm = (u32)((tst >> 15) & 1ull) ? 1 : 0;
+    fill_state_count(st);
+    st->fst = (gs_prim & PRIM_FST) ? 1 : 0;
+    st->tex_lod = gs_tex_lod();
+    st->mip = gs_dyn_mip;
+    st->tex_point = ((tex1_reg() >> 5) & 1ull) ? 0 : 1;
+    st->wms  = (u32)(cl & 3ull);
+    st->wmt  = (u32)((cl >> 2) & 3ull);
+    st->minu = (u32)((cl >> 4) & 0x3FFull);
+    st->maxu = (u32)((cl >> 14) & 0x3FFull);
+    st->minv = (u32)((cl >> 24) & 0x3FFull);
+    st->maxv = (u32)((cl >> 34) & 0x3FFull);
+    if (st->tex_lod) {
+        st->minu >>= st->tex_lod; st->maxu >>= st->tex_lod;
+        st->minv >>= st->tex_lod; st->maxv >>= st->tex_lod;
+    }
+    st->tfx = (u32)((t0 >> 35) & 3ull);
+    st->tcc = (u32)((t0 >> 34) & 1ull) ? 1 : 0;
+    st->tme = (gs_prim & PRIM_TME) ? 1 : 0;
+    st->tex_index = 0xFFFFFFFFu;
+    st->rt = rt_slot(fb_base());
+    {   static int in_disp;
+        int now_disp = gs_disp_base && fb_base() == gs_disp_base;
+        if (now_disp && !in_disp) gs_guest_frames++;
+        in_disp = now_disp;
+    }
+    u32 rt_epoch_before = st->rt < GS_RT_SLOTS ? gs_rt_epoch[st->rt] : 0u;
+    u32 rt_aepoch_before = st->rt < GS_RT_SLOTS ? gs_rt_aepoch[st->rt] : 0u;
+    if (st->rt < GS_RT_SLOTS) {
+        gs_rt_drawn[st->rt]++;
+        gs_rt_epoch[st->rt] = gs_epoch_seq;
+        gs_rt_fbw[st->rt] = st->fb_w;
+        gs_rt_psm[st->rt] = (u8)st->fb_psm;
+        if (st->fb_psm == PSM_CT32 && (st->fb_mask >> 24) != 0xFFu) {
+            gs_rt_aepoch[st->rt] = gs_epoch_seq;
+            gs_rt_cpu_alpha[st->rt] = 0;   /* cpu_alpha_sprite sets it again */
+        }
+        {   gs_geom fg;
+            u32 pages;
+            gs_psm_geom(st->fb_psm, &fg);
+            pages = gs_page_span(&fg, st->fb_w, st->fb_w - 1u, st->fb_h - 1u);
+            if (pages > gs_rt_pages[st->rt]) gs_rt_pages[st->rt] = pages;
+            if (gs_rt_field[st->rt] != ps2_gs_frame_count) gs_rt_field_pages[st->rt] = 0;
+            if (pages > gs_rt_field_pages[st->rt]) gs_rt_field_pages[st->rt] = pages;
+            gs_rt_field[st->rt] = ps2_gs_frame_count;
+        }
+        gs_rt_zbase[st->rt] = zb_base();
+        if (st->zwrite) gs_rt_zepoch[st->rt] = gs_epoch_seq;
+    }
+    st->tex_rt = 0;
+    st->index_rt = 0;
+    st->clut_tex = 0;
+    if (st->tme) {
+        u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
+        u32 tpsm = (u32)((t0 >> 20) & 0x3Full);
+        int slot = rt_find(tbp);
+        int use_rt = 0;
+        static int index_rt_off = -1;
+        if (index_rt_off < 0) {
+            const char *e = getenv("PS2_NO_INDEX_RT");
+            index_rt_off = (e && *e && *e != '0') ? 1 : 0;
+            if (index_rt_off) ps2_log("GS: PSMT8H indices are always read from VRAM "
+                                      "(PS2_NO_INDEX_RT)");
+        }
+        /* PSMT8H reads the alpha byte of 32-bit pixels: AC4 remaps the back
+           buffer's alpha through a CLUT (its haze strength) before the haze
+           pass blends with destination alpha.  The frame is only on the GPU. */
+        if (slot >= 0 && (!psm_is_indexed(tpsm)
+                          || (tpsm == PSM_T8H && !index_rt_off
+                              && ((t0 >> 51) & 0xFull) == PSM_CT32))) {
+            gs_geom g;
+            u32 tbw = (u32)((t0 >> 14) & 0x3Full) * 64u;
+            u32 tw  = 1u << ((t0 >> 26) & 0xFull);
+            u32 th  = 1u << ((t0 >> 30) & 0xFull);
+            u32 hi, rt_hi;
+            gs_psm_geom((u32)((t0 >> 20) & 0x3Full), &g);
+            if (!tbw) tbw = g.pw;
+            tw = tex_reach(st->wms, st->minu, st->maxu, tw);
+            th = tex_reach(st->wmt, st->minv, st->maxv, th);
+            hi = tbp + gs_page_span(&g, tbw, tw - 1u, th - 1u) * GS_PAGE_BYTES;
+            rt_hi = gs_rt_pages[slot]
+                  ? tbp + gs_rt_pages[slot] * GS_PAGE_BYTES : hi;
+            if (hi > rt_hi) hi = rt_hi;
+            {   u32 se = gs_rt_epoch[slot];
+                if ((u32)slot == st->rt) {
+                    fill_no_memo = 1;
+                    se = rt_epoch_before;
+                    hi = rt_hi;
+                }
+                use_rt = se && gs_range_epoch(tbp, hi) <= se;
+                if (use_rt && (u32)slot == st->rt) st->tex_self = 1;
+            }
+            {   static u32 no_rt = 0xFFFFFFFFu;
+                if (no_rt == 0xFFFFFFFFu) {
+                    const char *e = getenv("PS2_NO_RT_TEX");
+                    no_rt = (e && *e) ? (u32)strtoul(e, NULL, 0) : 0u;
+                    if (no_rt) ps2_log("GS: render-target texture binding "
+                                       "refused for %s (PS2_NO_RT_TEX)",
+                                       no_rt == 1u ? "every address"
+                                                   : "one address");
+                }
+                if (no_rt && (no_rt == 1u || no_rt == tbp)) use_rt = 0;
+            }
+            if (tpsm == PSM_T8H) {
+                /* indices in the alpha bytes: the target counts only if a draw
+                   wrote its alpha after VRAM last did */
+                u32 ae = (u32)slot == st->rt ? rt_aepoch_before : gs_rt_aepoch[slot];
+                use_rt = use_rt && ae && gs_range_epoch(tbp, hi) <= ae;
+            }
+            if (use_rt && tpsm == PSM_T8H) {
+                /* the palette must be current in VRAM; one drawn by the GPU
+                   is not handled together with indices from a target */
+                u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u, pidx;
+                int cs = rt_covering(cbp);
+                if (cs >= 0 && gs_range_epoch(cbp, cbp + 1u) <= gs_rt_epoch[cs]) {
+                    use_rt = 0;
+                } else if ((pidx = clut_palette_texture(t0)) == 0xFFFFFFFFu) {
+                    use_rt = 0;
+                } else {
+                    st->index_rt = 1;
+                    st->clut_tex = pidx + 1u;
+                    fill_no_memo = 1;
+                    if (PS2_ENV("PS2_TRACE_INDEX_RT")) {
+                        static u32 seen[32], ns;
+                        u32 k, key = tbp ^ (cbp << 1) ^ ((u32)st->rt << 28);
+                        for (k = 0; k < ns && seen[k] != key; k++) {}
+                        if (k == ns && ns < 32u) {
+                            seen[ns++] = key;
+                            ps2_log("index-rt: field %u tbp=%u (rt%d psm %u fbw %u) "
+                                    "cbp=%u into rt%u fbp=%u psm %u self=%d %ux%u",
+                                    ps2_gs_frame_count, tbp, slot,
+                                    (u32)gs_rt_psm[slot], gs_rt_fbw[slot], cbp,
+                                    st->rt, fb_base(), st->fb_psm, st->tex_self,
+                                    1u << ((t0 >> 26) & 0xFull),
+                                    1u << ((t0 >> 30) & 0xFull));
+                        }
+                    }
+                }
+            }
+            if (!use_rt) {
+                gs_rt_tex_missed++;
+                if (PS2_ENV("PS2_TRACE_RT_MISS")) {
+                    static u32 said;
+                    u32 p, pm = 0, em = 0, lo = tbp / GS_PAGE_BYTES;
+                    u32 hp = (hi - 1u) / GS_PAGE_BYTES;
+                    for (p = lo; p <= hp && p < GS_VRAM_PAGES; p++)
+                        if (gs_page_epoch[p] > em) { em = gs_page_epoch[p]; pm = p; }
+                    if (said++ < 2000u)
+                        ps2_log("rt-miss: field %u tbp=%u (slot %d, epoch %u) into "
+                                "rt%u fbp=%u | newest write page %u (+%u) epoch %u "
+                                "owner %X psm %u bw %u | hi=%u",
+                                ps2_gs_frame_count, tbp, slot, gs_rt_epoch[slot],
+                                st->rt, st->rt < GS_RT_SLOTS ? gs_rt_base[st->rt] : 0u,
+                                pm, pm - lo, em, gs_page_owner[pm],
+                                (u32)gs_page_owner_psm[pm], (u32)gs_page_owner_bw[pm],
+                                hi);
+                }
+            }
+        }
+        if (psm_is_z((u32)((t0 >> 20) & 0x3Full))) {
+            int zslot = rt_find_z(tbp);
+            if (zslot >= 0 && (u32)zslot != st->rt) {
+                st->tex_depth = 1;
+                gs_rt_ztex_draws++;
+                use_rt = 1;
+                slot = zslot;
+            }
+        }
+        if (use_rt) {
+            st->tex_rt = (u32)slot + 1u;
+            st->tex_w = (float)(1u << ((t0 >> 26) & 0xFull));
+            st->tex_h = (float)(1u << ((t0 >> 30) & 0xFull));
+            gs_rt_tex_draws++;
+        } else {
+            {   static int probe = -1;
+                if (probe < 0) probe = getenv("PS2_CLUT_RT") != NULL;
+                if (probe) clut_rt_probe(t0, st->rt);
+            }
+            st->clut_rt = 0;
+            {   /* A CLUT the GPU drew (AC4 renders its sun halo palette every
+                   field): VRAM never sees it, so decode the indices and let
+                   gs.frag read the colours from the render target. */
+                static int off = -1;
+                u32 tpsm = (u32)((t0 >> 20) & 0x3Full);
+                u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
+                int cs;
+                if (off < 0) {
+                    const char *e = getenv("PS2_NO_CLUT_RT");
+                    off = (e && *e && *e != '0') ? 1 : 0;
+                }
+                if (!off && psm_is_indexed(tpsm)
+                    && ((t0 >> 51) & 0xFull) == PSM_CT32 && !((t0 >> 55) & 1ull)
+                    && (cs = rt_covering(cbp)) >= 0 && (u32)cs != st->rt
+                    && gs_range_epoch(cbp, cbp + 1u) <= gs_rt_epoch[cs]
+                    && rt_addr_xy(cs, cbp, &st->clut_xy)) {
+                    st->clut_rt = (u32)cs + 1u;
+                    st->clut_four = tpsm == PSM_T4 || tpsm == PSM_T4HL || tpsm == PSM_T4HH;
+                    fill_no_memo = 1;
+                }
+            }
+            tex_index_mode = st->clut_rt != 0;
+            st->tex_index = current_texture(&st->tex_w, &st->tex_h);
+            tex_index_mode = 0;
+            if ((st->mip & (1u << 21)) && !st->clut_rt
+                && st->tex_index != 0xFFFFFFFFu) {
+                /* the next level, blended in per pixel by gs.frag */
+                float w2, h2;
+                u32 idx2;
+                gs_dyn_lod++;
+                idx2 = current_texture(&w2, &h2);
+                gs_dyn_lod--;
+                if (idx2 != 0xFFFFFFFFu && idx2 != st->tex_index)
+                    st->clut_tex = idx2 + 1u;
+            }
+            if (st->tex_index == 0xFFFFFFFFu) st->tme = 0;
+        }
+    }
+    if ((st->mip & (1u << 21))
+        && (!st->tme || st->tex_rt || st->index_rt || st->clut_rt || !st->clut_tex))
+        st->mip &= ~(1u << 21);
+    {   static int off = -1;
+        int zs;
+        if (off < 0) {
+            const char *e = getenv("PS2_NO_ZCOPY");
+            off = (e && *e && *e != '0') ? 1 : 0;
+            if (off) ps2_log("GS: Z copies into depth disabled (PS2_NO_ZCOPY)");
+        }
+        st->zcopy = !off && st->tme && st->tex_depth && psm_is_z(st->fb_psm);
+        if (st->rt < GS_RT_SLOTS) {
+            if (st->zcopy) gs_rt_zframe[st->rt] = 1;
+            else if (!psm_is_z(st->fb_psm)) gs_rt_zframe[st->rt] = 0;
+        }
+        st->zrt = st->rt;
+        zs = off ? -1 : rt_find(zb_base());
+        if (zs >= 0 && (u32)zs != st->rt && gs_rt_zframe[zs]) st->zrt = (u32)zs;
+    }
+    st->zclear_rt = 0;
+    st->zclear_bits = 0;
+    {   /* A plain colour draw into memory that another target's draws use as
+           their Z buffer writes depth on the PS2 -- AC4 clears its Z buffer
+           with a black sprite into it as PSMCT32 (alpha masked).  Here each
+           target has its own depth image, so without this the hangar kept
+           the depth of earlier frames and dropped parts of the floor and the
+           aircraft. */
+        static int off = -1;
+        u32 fpsm = st->fb_psm, fb = fb_base(), bits = 0, i;
+        int x = -1;
+        if (off < 0) {
+            const char *e = getenv("PS2_NO_ZCLEAR");
+            off = (e && *e && *e != '0') ? 1 : 0;
+            if (off) ps2_log("GS: colour draws into Z buffers stay colour-only "
+                             "(PS2_NO_ZCLEAR)");
+        }
+        if (fpsm == PSM_CT24 || fpsm == 0x31u) bits = 24;
+        else if (fpsm == PSM_CT32 || fpsm == 0x30u)
+            bits = (st->fb_mask >> 24) == 0xFFu ? 24 : 32;
+        if (!off && !st->tme && bits && (st->fb_mask & 0x00FFFFFFu) == 0u
+            && st->rt < GS_RT_SLOTS && !gs_rt_zframe[st->rt]) {
+            for (i = 0; i < gs_rt_n; i++) {
+                if (i == st->rt || !gs_rt_zepoch[i] || gs_rt_zbase[i] != fb) continue;
+                if (x < 0 || gs_rt_zepoch[i] > gs_rt_zepoch[x]) x = (int)i;
+            }
+            if (x >= 0) {
+                st->zclear_rt = (u32)x + 1u;
+                st->zclear_bits = bits;
+            }
+        }
+    }
+    {   /* debugging: PS2_TRACE_GSREGS=N logs every distinct GS draw state of the
+           N-th field after the first draw (pair it with PS2_GS_STATE_MEMO=0) */
+        static int want = -2;
+        static u32 base, last_h, nlog;
+        if (want == -2) {
+            const char *e = getenv("PS2_TRACE_GSREGS");
+            want = e ? (int)strtol(e, NULL, 0) : -1;
+            base = ps2_gs_frame_count;
+        }
+        if (want >= 0 && ps2_gs_frame_count - base == (u32)want && nlog < 4000) {
+            u64 r[12];
+            u32 h = 2166136261u, k;
+            r[0] = frame_reg(); r[1] = zbuf_reg(); r[2] = test_reg();
+            r[3] = alpha_reg(); r[4] = tex0_reg(); r[5] = gs_reg[GS_TEXA];
+            r[6] = gs_reg[GS_COLCLAMP]; r[7] = gs_reg[ctx_of() ? GS_FBA_2 : GS_FBA_1];
+            r[8] = gs_prim; r[9] = clamp_reg();
+            r[10] = tex1_reg(); r[11] = miptbp1_reg();
+            for (k = 0; k < 12; k++) h = (h ^ (u32)r[k] ^ (u32)(r[k] >> 32)) * 16777619u;
+            if (h != last_h) {
+                last_h = h;
+                nlog++;
+                ps2_log("gsregs: prim=%03llX FRAME fbp=%05X fbw=%u psm=%02X msk=%08X | "
+                        "ZBUF zbp=%05X psm=%X zmsk=%u | TEST %09llX | ALPHA %llX fix=%u | "
+                        "TEX0 tbp=%05X tbw=%u psm=%02X %ux%u tcc=%u tfx=%u | TEXA %llX | "
+                        "CLAMP %llX | colclamp=%u fba=%u | rt=%u texrt=%u | tex0=%016llX "
+                        "| TEX1 %016llX MIPTBP1 %016llX",
+                        (unsigned long long)r[8], (u32)(r[0] & 0x1FF) * 2048u,
+                        (u32)((r[0] >> 16) & 0x3F) * 64u, (u32)((r[0] >> 24) & 0x3F),
+                        (u32)(r[0] >> 32), (u32)(r[1] & 0x1FF) * 2048u,
+                        (u32)((r[1] >> 24) & 0xF), (u32)((r[1] >> 32) & 1),
+                        (unsigned long long)r[2], (unsigned long long)(r[3] & 0xFF),
+                        (u32)((r[3] >> 32) & 0xFF), (u32)(r[4] & 0x3FFF) * 64u,
+                        (u32)((r[4] >> 14) & 0x3F) * 64u, (u32)((r[4] >> 20) & 0x3F),
+                        1u << ((r[4] >> 26) & 0xF), 1u << ((r[4] >> 30) & 0xF),
+                        (u32)((r[4] >> 34) & 1), (u32)((r[4] >> 35) & 3),
+                        (unsigned long long)r[5], (unsigned long long)r[9],
+                        (u32)(r[6] & 1), (u32)(r[7] & 1), st->rt, st->tex_rt,
+                        (unsigned long long)r[4], (unsigned long long)r[10],
+                        (unsigned long long)r[11]);
+            }
+        }
+    }
+}
+
+#define DRAWCENSUS_N 2048
+static struct {
+    u32 path;
+    u64 first_seq, last_seq;
+    u32 prim, tme, ate, atst, aref, ztst, zwrite, abe, fbpsm, fbw, fbh, tfx;
+    u32 fbp, zbp, zpsm, tbp, tpsm, tcc, rt, texrt;
+    u32 wms, wmt, minu, maxu, minv, maxv;
+    u32 afail, zte;
+    u32 ba, bb, bc, bd, bfix, abe2;
+    u32 colclamp;
+    s32 sc[4];
+    float x0, y0, x1, y1, z0, z1;
+    float cmin, cmax, amin, amax;
+    float s0, t0_, s1, t1;
+    float q0, q1, u0, u1, v0, v1;
+    u64 tex1;
+    int fst;
+    u64 n;
+} drawc[DRAWCENSUS_N];
+static unsigned drawc_n;
+static u64 drawc_dropped;
+static u64 drawc_seq;
+u64 ps2_gs_prim_seq;
+
+#define BLITLOG_N 128
+static struct {
+    u64 frame;
+    u32 dst, src;
+    float y0, y1, t0, t1, x0, x1, s0, s1;
+} blitlog[BLITLOG_N];
+static u64 blitlog_n;
+
+void ps2_gs_blit_log_report(void) {
+    u64 have = blitlog_n < BLITLOG_N ? blitlog_n : BLITLOG_N;
+    u64 first = blitlog_n - have, k;
+    if (!have) {
+        ps2_log("GS render-target blits: none recorded");
+        return;
+    }
+    ps2_log("GS render-target blits: last %llu of %llu, oldest first:",
+            (unsigned long long)have, (unsigned long long)blitlog_n);
+    for (k = 0; k < have; k++) {
+        u64 i = (first + k) % BLITLOG_N;
+        ps2_log("   frame %llu  rt%u <- rt%u  dst x %.1f..%.1f y %.1f..%.1f"
+                "  src s %.1f..%.1f t %.1f..%.1f",
+                (unsigned long long)blitlog[i].frame, blitlog[i].dst,
+                blitlog[i].src, blitlog[i].x0, blitlog[i].x1,
+                blitlog[i].y0, blitlog[i].y1, blitlog[i].s0, blitlog[i].s1,
+                blitlog[i].t0, blitlog[i].t1);
+    }
+}
+
+#define VH_BINS 14
+#define VH_SAMPLES 6
+static struct {
+    u64 total, inside;
+    u64 bin[VH_BINS];
+    float worst;
+    float sx0, sx1, sy0, sy1;
+    float ofx, ofy;
+    unsigned ns;
+    float sx[VH_SAMPLES], sy[VH_SAMPLES];
+} vhist[4];
+
+void ps2_gs_census_reset(void) {
+    drawc_n = 0;
+    drawc_dropped = 0;
+    drawc_seq = 0;
+    ps2_gs_prim_seq = 0;
+    texc_n = 0;
+    trxc_n = 0;
+    trxc_cur = -1;
+    memset(drawc, 0, sizeof drawc);
+    memset(vhist, 0, sizeof vhist);
+}
+
+void ps2_gs_vertex_hist_report(void);
+void ps2_gs_blit_log_report(void);
+
+void ps2_gs_draw_census_report(void) {
+    unsigned i;
+    ps2_log("GS draw census (%u distinct states%s), #first..#last is "
+            "submission order:", drawc_n,
+            drawc_dropped ? "  -- TABLE FULL, more were dropped" : "");
+    if (drawc_dropped)
+        ps2_log("  %llu draws had a state this table had no room for; raise "
+                "DRAWCENSUS_N before trusting this list to be complete.",
+                (unsigned long long)drawc_dropped);
+    for (i = 0; i < drawc_n; i++) {
+        ps2_log("  #%llu..%llu PATH%u rt%u fbp=%-8u fbpsm=%-3u %ux%u | prim=%u tme=%u tfx=%u "
+                "tcc=%u abe=%u ate=%u/%u/%u ztst=%u zw=%u | x%llu",
+                (unsigned long long)drawc[i].first_seq,
+                (unsigned long long)drawc[i].last_seq,
+                drawc[i].path, drawc[i].rt, drawc[i].fbp, drawc[i].fbpsm,
+                drawc[i].fbw, drawc[i].fbh,
+                drawc[i].prim, drawc[i].tme, drawc[i].tfx, drawc[i].tcc,
+                drawc[i].abe, drawc[i].ate, drawc[i].atst, drawc[i].aref,
+                drawc[i].ztst, drawc[i].zwrite,
+                (unsigned long long)drawc[i].n);
+        {
+            static const char *af[4] = { "KEEP", "FB_ONLY", "ZB_ONLY",
+                                         "RGB_ONLY" };
+            static const char *ab[4] = { "Cs", "Cd", "0", "?" };
+            static const char *cc[4] = { "As", "Ad", "FIX", "?" };
+        {
+            static const char *zf[16] = {
+                "Z32","Z24","Z16","?","?","?","?","?","?","?","Z16S",
+                "?","?","?","?","?" };
+            ps2_log("      zbuf zbp=%-8u psm=%s", drawc[i].zbp,
+                    zf[drawc[i].zpsm & 15u]);
+        }
+        ps2_log("      test afail=%s zte=%u | blend abe=%u "
+                    "(%s-%s)*%s+%s fix=%u colclamp=%u", af[drawc[i].afail & 3u],
+                    drawc[i].zte, drawc[i].abe2,
+                    ab[drawc[i].ba & 3u], ab[drawc[i].bb & 3u],
+                    cc[drawc[i].bc & 3u], ab[drawc[i].bd & 3u],
+                    drawc[i].bfix, drawc[i].colclamp);
+        }
+        ps2_log("      tex tbp=%-8u psm=%-3u texrt=%u  xy [%.1f,%.1f]..[%.1f,%.1f]"
+                "  z [%.6f,%.6f]  rgb [%.0f,%.0f] a [%.0f,%.0f]  fst=%d "
+                "st [%g,%g]..[%g,%g]",
+                drawc[i].tbp, drawc[i].tpsm, drawc[i].texrt,
+                drawc[i].x0, drawc[i].y0, drawc[i].x1, drawc[i].y1,
+                (double)drawc[i].z0, (double)drawc[i].z1,
+                drawc[i].cmin, drawc[i].cmax, drawc[i].amin, drawc[i].amax,
+                drawc[i].fst, (double)drawc[i].s0, (double)drawc[i].t0_,
+                (double)drawc[i].s1, (double)drawc[i].t1);
+        if (drawc[i].tme) {
+            static const char *wm[4] = { "REPEAT", "CLAMP", "REGION_CLAMP",
+                                         "REGION_REPEAT" };
+            ps2_log("      clamp wms=%s wmt=%s u [%u,%u] v [%u,%u]",
+                    wm[drawc[i].wms & 3u], wm[drawc[i].wmt & 3u],
+                    drawc[i].minu, drawc[i].maxu,
+                    drawc[i].minv, drawc[i].maxv);
+            {   u64 t1 = drawc[i].tex1;
+                s32 k = (s32)((t1 >> 32) & 0xFFFull);
+                if (k & 0x800) k -= 0x1000;
+                ps2_log("      tex1 lcm=%u mxl=%u mmag=%u mmin=%u mtba=%u L=%u "
+                        "K=%.2f  q [%g,%g]  uv [%.3f,%.3f]..[%.3f,%.3f]",
+                        (u32)(t1 & 1u), (u32)((t1 >> 2) & 7u),
+                        (u32)((t1 >> 5) & 1u), (u32)((t1 >> 6) & 7u),
+                        (u32)((t1 >> 9) & 1u), (u32)((t1 >> 19) & 3u),
+                        (double)k / 16.0, (double)drawc[i].q0,
+                        (double)drawc[i].q1, (double)drawc[i].u0,
+                        (double)drawc[i].v0, (double)drawc[i].u1,
+                        (double)drawc[i].v1);
+            }
+        }
+    }
+    ps2_gs_vertex_hist_report();
+    ps2_gs_blit_log_report();
+}
+
+static void vhist_add(unsigned path, float x, float y,
+                      float sx0, float sx1, float sy0, float sy1) {
+    float dx = 0.0f, dy = 0.0f, d;
+    unsigned b;
+    if (path > 3u) path = 0u;
+    vhist[path].total++;
+    vhist[path].sx0 = sx0; vhist[path].sx1 = sx1;
+    vhist[path].sy0 = sy0; vhist[path].sy1 = sy1;
+    {   u64 off = xyoff_reg();
+        vhist[path].ofx = (float)(off & 0xFFFFull) / 16.0f;
+        vhist[path].ofy = (float)((off >> 32) & 0xFFFFull) / 16.0f; }
+    if (vhist[path].ns < VH_SAMPLES) {
+        vhist[path].sx[vhist[path].ns] = x;
+        vhist[path].sy[vhist[path].ns] = y;
+        vhist[path].ns++;
+    }
+    if (x < sx0) dx = sx0 - x; else if (x > sx1) dx = x - sx1;
+    if (y < sy0) dy = sy0 - y; else if (y > sy1) dy = y - sy1;
+    d = dx > dy ? dx : dy;
+    if (!(d > 0.0f)) {
+        vhist[path].inside++;
+        vhist[path].bin[0]++;
+        return;
+    }
+    if (d > vhist[path].worst) vhist[path].worst = d;
+    for (b = 1; b < VH_BINS - 1u && d >= (float)(1u << b); b++) { }
+    vhist[path].bin[b]++;
+}
+
+void ps2_gs_vertex_hist_report(void) {
+    static const char *nm[4] = { "unknown path", "PATH1 (VU1 XGKICK)",
+                                 "PATH2 (VIF1 DIRECT)", "PATH3 (GIF DMA)" };
+    unsigned p, b;
+    for (p = 0; p < 4u; p++) {
+        char line[512];
+        int off = 0;
+        if (!vhist[p].total) continue;
+        ps2_log("vertex placement, %s: %llu vertices, %.1f%% inside the "
+                "scissor box, worst %.0f px outside", nm[p],
+                (unsigned long long)vhist[p].total,
+                100.0 * (double)vhist[p].inside / (double)vhist[p].total,
+                vhist[p].worst);
+        ps2_log("   judged against scissor x %.0f..%.0f  y %.0f..%.0f, "
+                "XYOFFSET (%.1f,%.1f)", vhist[p].sx0, vhist[p].sx1,
+                vhist[p].sy0, vhist[p].sy1, vhist[p].ofx, vhist[p].ofy);
+        {
+            char sm[256];
+            int so = 0;
+            unsigned k;
+            for (k = 0; k < vhist[p].ns && so < (int)sizeof sm - 40; k++)
+                so += snprintf(sm + so, sizeof sm - (size_t)so,
+                               " (%.1f,%.1f)->raw(%.0f,%.0f)",
+                               vhist[p].sx[k], vhist[p].sy[k],
+                               (vhist[p].sx[k] + vhist[p].ofx) * 16.0f,
+                               (vhist[p].sy[k] + vhist[p].ofy) * 16.0f);
+            ps2_log("   first vertices, window->raw:%s", sm);
+        }
+        for (b = 0; b < VH_BINS && off < (int)sizeof line - 40; b++) {
+            if (!vhist[p].bin[b]) continue;
+            if (b == 0)
+                off += snprintf(line + off, sizeof line - (size_t)off,
+                                "  inside=%llu",
+                                (unsigned long long)vhist[p].bin[0]);
+            else if (b == VH_BINS - 1u)
+                off += snprintf(line + off, sizeof line - (size_t)off,
+                                "  >=%u:%llu", 1u << (b - 1u),
+                                (unsigned long long)vhist[p].bin[b]);
+            else
+                off += snprintf(line + off, sizeof line - (size_t)off,
+                                "  <%u:%llu", 1u << b,
+                                (unsigned long long)vhist[p].bin[b]);
+        }
+        ps2_log("   px outside:%s", line);
+    }
+}
+
+static void draw_census(const ps2_vk_state *st, const ps2_vk_vertex *v, int n) {
+    unsigned i;
+    int k;
+    if (!ps2_diag_armed) return;
+    for (i = 0; i < drawc_n; i++)
+        if (drawc[i].path == (u32)GS_PATH
+            && drawc[i].prim == (gs_prim & 7u) && drawc[i].tme == (u32)st->tme
+            && drawc[i].ate == (u32)st->ate && drawc[i].atst == (u32)st->atst
+            && drawc[i].aref == st->aref && drawc[i].ztst == st->ztst
+            && drawc[i].zwrite == (u32)st->zwrite && drawc[i].abe == (u32)st->abe
+            && drawc[i].tfx == st->tfx && drawc[i].fbp == fb_base()
+            && drawc[i].wms == st->wms && drawc[i].wmt == st->wmt
+            && drawc[i].minu == st->minu && drawc[i].maxu == st->maxu
+            && drawc[i].minv == st->minv && drawc[i].maxv == st->maxv
+            && drawc[i].tbp == (u32)(tex0_reg() & 0x3FFFull) * 256u) break;
+    if (i == drawc_n) {
+        if (drawc_n >= DRAWCENSUS_N) { drawc_dropped++; return; }
+        drawc_n++;
+        drawc[i].path = (u32)GS_PATH;
+        drawc[i].first_seq = ps2_gs_prim_seq;
+        drawc[i].prim = gs_prim & 7u; drawc[i].tme = st->tme;
+        drawc[i].ate = st->ate; drawc[i].atst = st->atst;
+        drawc[i].aref = st->aref; drawc[i].ztst = st->ztst;
+        drawc[i].zwrite = st->zwrite; drawc[i].abe = st->abe;
+        drawc[i].tfx = st->tfx;
+        drawc[i].fbp = fb_base();
+        drawc[i].tbp = (u32)(tex0_reg() & 0x3FFFull) * 256u;
+        drawc[i].x0 = drawc[i].y0 = 1e9f;
+        drawc[i].x1 = drawc[i].y1 = -1e9f;
+        drawc[i].z0 = drawc[i].cmin = drawc[i].amin = 1e9f;
+        drawc[i].z1 = drawc[i].cmax = drawc[i].amax = -1e9f;
+        drawc[i].s0 = drawc[i].t0_ = 1e9f;
+        drawc[i].s1 = drawc[i].t1 = -1e9f;
+        drawc[i].q0 = drawc[i].u0 = drawc[i].v0 = 1e9f;
+        drawc[i].q1 = drawc[i].u1 = drawc[i].v1 = -1e9f;
+    }
+    drawc[i].n++;
+    drawc[i].last_seq = ps2_gs_prim_seq;
+    drawc_seq++;
+    drawc[i].fbpsm = st->fb_psm; drawc[i].fbw = st->fb_w; drawc[i].fbh = st->fb_h;
+    drawc[i].fbp = fb_base(); drawc[i].zbp = zb_base();
+    drawc[i].zpsm = (u32)((zbuf_reg() >> 24) & 0xFull);
+    drawc[i].tbp = (u32)(tex0_reg() & 0x3FFFull) * 256u;
+    drawc[i].tpsm = (u32)((tex0_reg() >> 20) & 0x3Full);
+    drawc[i].tcc = (u32)st->tcc;
+    drawc[i].afail = st->afail; drawc[i].zte = st->zte;
+    drawc[i].ba = st->alpha_a; drawc[i].bb = st->alpha_b;
+    drawc[i].bc = st->alpha_c; drawc[i].bd = st->alpha_d;
+    drawc[i].bfix = st->alpha_fix; drawc[i].abe2 = (u32)st->abe;
+    drawc[i].colclamp = (u32)(gs_reg[GS_COLCLAMP] & 1ull);
+    drawc[i].wms = st->wms; drawc[i].wmt = st->wmt;
+    drawc[i].minu = st->minu; drawc[i].maxu = st->maxu;
+    drawc[i].minv = st->minv; drawc[i].maxv = st->maxv;
+    drawc[i].rt = st->rt; drawc[i].texrt = st->tex_rt;
+    drawc[i].fst = st->fst;
+    drawc[i].tex1 = tex1_reg();
+    for (k = 0; k < 4; k++) drawc[i].sc[k] = st->scissor[k];
+    for (k = 0; k < n; k++) {
+        float c;
+        vhist_add((unsigned)GS_PATH, v[k].x, v[k].y,
+                  (float)st->scissor[0], (float)st->scissor[1],
+                  (float)st->scissor[2], (float)st->scissor[3]);
+        if (v[k].x < drawc[i].x0) drawc[i].x0 = v[k].x;
+        if (v[k].x > drawc[i].x1) drawc[i].x1 = v[k].x;
+        if (v[k].y < drawc[i].y0) drawc[i].y0 = v[k].y;
+        if (v[k].y > drawc[i].y1) drawc[i].y1 = v[k].y;
+        if (v[k].z < drawc[i].z0) drawc[i].z0 = v[k].z;
+        if (v[k].z > drawc[i].z1) drawc[i].z1 = v[k].z;
+        c = v[k].r > v[k].g ? v[k].r : v[k].g;
+        if (v[k].b > c) c = v[k].b;
+        if (c < drawc[i].cmin) drawc[i].cmin = c;
+        if (c > drawc[i].cmax) drawc[i].cmax = c;
+        if (v[k].a < drawc[i].amin) drawc[i].amin = v[k].a;
+        if (v[k].a > drawc[i].amax) drawc[i].amax = v[k].a;
+        if (v[k].s < drawc[i].s0) drawc[i].s0 = v[k].s;
+        if (v[k].s > drawc[i].s1) drawc[i].s1 = v[k].s;
+        if (v[k].t < drawc[i].t0_) drawc[i].t0_ = v[k].t;
+        if (v[k].t > drawc[i].t1) drawc[i].t1 = v[k].t;
+        if (v[k].q < drawc[i].q0) drawc[i].q0 = v[k].q;
+        if (v[k].q > drawc[i].q1) drawc[i].q1 = v[k].q;
+        if (st->tme && v[k].q != 0.0f) {
+            float u = st->fst ? v[k].s : v[k].s / v[k].q * st->tex_w;
+            float w = st->fst ? v[k].t : v[k].t / v[k].q * st->tex_h;
+            if (u < drawc[i].u0) drawc[i].u0 = u;
+            if (u > drawc[i].u1) drawc[i].u1 = u;
+            if (w < drawc[i].v0) drawc[i].v0 = w;
+            if (w > drawc[i].v1) drawc[i].v1 = w;
+        }
+    }
+}
+
+static void vk_vertex(ps2_vk_vertex *o, const gs_vtx *v, int iip,
+                      const gs_vtx *flat, int fst, u32 lod) {
+    const gs_vtx *c = iip ? v : flat;
+    o->x = (float)v->x / 16.0f + 0.5f;
+    o->y = (float)v->y / 16.0f + 0.5f;
+    o->z = z_norm(v->z);
+    o->r = (float)((c->rgba >> 0) & 0xFF);
+    o->g = (float)((c->rgba >> 8) & 0xFF);
+    o->b = (float)((c->rgba >> 16) & 0xFF);
+    o->a = (float)((c->rgba >> 24) & 0xFF);
+    if (fst) { float m = 16.0f * (float)(1u << lod);
+               o->s = (float)v->u / m; o->t = (float)v->v / m; o->q = 1.0f; }
+    else     { o->s = v->s; o->t = v->t; o->q = v->q; }
+    o->fog = v->fog;
+    o->round_uv = 0;
+    o->clamp_u = o->clamp_v = 0;
+}
+
+/* Texel coordinates a sprite axis samples at its first and last covered pixel
+   centre (vertex coordinates carry the +0.5 pixel-centre offset), packed for
+   PS2_VK_RUV_CLAMP.  Returns 0 when the axis covers no pixel. */
+static int sprite_clamp_axis(float e0, float e1, float c0, float c1, u32 *out) {
+    float pc0, pc1, d, a, b, lo, hi;
+    s32 l, h;
+    if (e1 <= e0) return 0;
+    pc0 = ceilf(e0 - 0.5f) + 0.5f;
+    pc1 = ceilf(e1 - 0.5f) - 0.5f;
+    if (pc1 < pc0) return 0;
+    d = (c1 - c0) / (e1 - e0);
+    a = c0 + (pc0 - e0) * d;
+    b = c0 + (pc1 - e0) * d;
+    lo = a < b ? a : b;
+    hi = a < b ? b : a;
+    l = (s32)lrintf(lo * 16.0f);
+    h = (s32)lrintf(hi * 16.0f);
+    if (l < -32768 || h > 32767) return 0;
+    *out = ((u32)l & 0xFFFFu) | (((u32)h & 0xFFFFu) << 16);
+    return 1;
+}
+
+static u32 sprite_round_axis(s32 p0, s32 p1, u32 t0, u32 t1) {
+    s32 dp = p1 - p0, dt = (s32)t1 - (s32)t0;
+    u32 a = (u32)abs(dp), b = (u32)abs(dt), span = a;
+    if (!a || ((p0 | p1 | (s32)t0 | (s32)t1) & 7)) return 0;
+    while (b) { u32 r = a % b; a = b; b = r; }
+    if (span / a >= 32u) return 0;
+    return dt <= 0 || !(span & (span - 1u)) ? 1u : 2u;
+}
+
+u64 ps2_kernel_vblank_count(void);
+
+/* AC4 widescreen: the camera is widened in the EE (ps2_hook.c), so the 4:3
+   frame buffer holds a 16:9 view that the presentation stretches.  The HUD,
+   text and menus are 2D draws the game places at the far Z plane (menus: at
+   Z 0) with the depth test off; they are pulled towards the centre so they
+   keep their 4:3 shape.  Markers that follow the world were projected through the widened
+   camera and stay where they are: the sun flare and lens ghosts carry real
+   depth, and target boxes and their labels are drawn depth-tested (GREATER),
+   even the parts at the far plane.  Full-width draws, untextured full-height
+   ones (fades and clears, which AC4 draws in 64-pixel strips), off-screen
+   targets and render-target copies stay too. */
+static float ws_area;
+static u32 ws_area_frame = ~0u;
+static int gs_ov_drawing;      /* mod overlay shapes: placed by the mod, never pulled */
+u32 ps2_ws_pillar_frame = 0x80000000u;
+static u32 ws_flight_frame = 0x80000000u;
+
+int ps2_gs_ws_pillar(u32 display_w) {
+    /* Most menus/movies display 640 columns; flight displays 512, even when
+       its backing render target is 640 wide. The 512-column objectives UI
+       is confined by its own transformed draws, not this presentation mask.
+       Use the displayed viewport,
+       not HUD visibility or accumulated overlay area, as a hard flight gate. */
+    if (display_w < 640u) return 0;
+    /* Flight HUD remains drawn behind the pause menu. Its far-plane glyphs
+       take priority over Z-zero menu coverage, including repeated overlays. */
+    return ps2_gs_frame_count - ps2_ws_pillar_frame <= 12u
+        && ps2_gs_frame_count - ws_flight_frame > 1u;
+}
+
+#define WS_MARKERS 256
+static float ws_marker[2][WS_MARKERS][4];
+static u32 ws_nmarker[2], ws_mcur, ws_marker_frame = ~0u, ws_bigmap_frame = 0x80000000u;
+
+/* x pulled to 4:3 about the centre (edge 0) or the left/right side (-1/1) */
+static float ws_map(float x, int edge, float s, float cx, float w) {
+    if (edge < 0) return x * s;
+    if (edge > 0) return w - (w - x) * s;
+    return cx + (x - cx) * s;
+}
+
+static int ws_seeker_sprite(const ps2_vk_state *st, const ps2_vk_vertex *v, int n) {
+    /* AC4's seeker is a sprite from the HUD symbol page, not caption text.
+       Identify its source cell, not its screen row: it can cross captions,
+       warning text and corner HUD blocks while following a projected target.
+       The cell bounds also allow a sprite clipped at the screen edge. */
+    if (n != 6 || !st->tme || !st->fst || st->tex_w != 256.0f || st->tex_h != 256.0f
+        || v[0].z < 0.99999f || st->scissor[0] != 0
+        || v[0].r <= 1.5f * v[0].g + 8.0f) return 0;
+    float u0 = 1e9f, u1 = -1e9f, t0 = 1e9f, t1 = -1e9f;
+    for (int k = 0; k < n; k++) {
+        u0 = fminf(u0, v[k].s); u1 = fmaxf(u1, v[k].s);
+        t0 = fminf(t0, v[k].t); t1 = fmaxf(t1, v[k].t);
+    }
+    return u0 >= 208.0f && u1 <= 232.0f && u1 > u0
+        && t0 >= 175.5f && t1 <= 192.5f && t1 > t0;
+}
+
+static void ws_hud(ps2_vk_state *st, ps2_vk_vertex *v, int n) {
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, s, cx, gx, l, r, aspect;
+    int k, edge;
+    if (gs_ov_drawing) return;
+    if (!ps2_cfg.widescreen || ps2_cfg.hud_layout == PS2_HUD_STRETCHED) return;
+    if (GS_PATH == 1 || st->tex_rt || st->fb_w < 480u || st->fb_h < 400u) return;
+    /* High-plane indexed formats reinterpret framebuffer alpha, including
+       haze/shadow passes whose current decode can fall back to VRAM. They
+       retain screen coverage even when no GPU target binding was found. */
+    u32 psm = (u32)((tex0_reg() >> 20) & 63u);
+    if (st->shuffle_rg || st->index_rt || st->zcopy
+        || (st->tme && (psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH))) return;
+    aspect = ps2_vk_game_aspect();
+    if (!(aspect > 1.34f)) return;
+    {   int realz = 0;
+        for (k = 0; k < n; k++) {
+            if (v[k].z < 0.99999f && v[k].z != 0.0f) realz = 1;
+            if (v[k].x < x0) x0 = v[k].x;
+            if (v[k].x > x1) x1 = v[k].x;
+            if (v[k].y < y0) y0 = v[k].y;
+            if (v[k].y > y1) y1 = v[k].y;
+        }
+        {   /* A full-height layer that only writes alpha -- black vertices with
+               (Cs - 0) * C + Cd, so the colour stays as it was -- sets up a
+               blend over the 3D scene, not HUD.  The hangar draws a dither
+               pattern into alpha this way in 64-pixel strips and then adds
+               its blue tint scaled by that alpha (Cs * Ad + Cd).  Pulled to
+               4:3, the sides kept the scene's alpha and took the tint four
+               times over: lighter, bluer strips with a hard vertical seam at
+               HUD layouts 1 and 2. */
+            int black = 1;
+            for (k = 0; k < n && black; k++)
+                if (v[k].r != 0.0f || v[k].g != 0.0f || v[k].b != 0.0f) black = 0;
+            int rgb_kept = (st->fb_mask & 0x00FFFFFFu) == 0x00FFFFFFu
+                || (black && st->abe && st->alpha_a == 0u && st->alpha_b == 2u
+                    && st->alpha_d == 1u);
+            if (rgb_kept && y0 <= 1.0f && y1 >= (float)st->fb_h - 1.0f) {
+                static int said;
+                if (!said) { said = 1; ps2_log("GS widescreen: full-height alpha-only layers kept full width"); }
+                return;
+            }
+        }
+        {   static int cues = -1, cue_step = 30;
+            if (cues < 0) {
+                const char *e = getenv("PS2_TRACE_WS_CUES");
+                cues = e != NULL;
+                if (e && !strcmp(e, "all")) cue_step = 1;
+            }
+            if (cues && ps2_gs_frame_count % (u32)cue_step == 0u
+                && !st->tme && v[0].z == 0.0f
+                && ((y1-y0 >= (float)st->fb_h-1.0f && x1-x0 < 2.0f)
+                    || (x1-x0 >= (float)st->fb_w-1.0f && y1-y0 < 2.0f)))
+                ps2_log("ws-guide: f%u n%d x%g..%g y%g..%g fb%ux%u",
+                    ps2_gs_frame_count,n,x0,x1,y0,y1,st->fb_w,st->fb_h);
+            if (cues && ps2_gs_frame_count % (u32)cue_step == 0u
+                && (!realz || (n == 2 && !st->tme))
+                && ((st->zte && st->ztst != 1u) || v[0].r > 1.5f*v[0].g+8.0f)
+                && x1-x0 <= 128.0f && y1-y0 <= 128.0f)
+                ps2_log("ws-cue: f%u n%d tex%d ztest%u/%u z%g x%g..%g y%g..%g rgb%g,%g,%g uv%g,%g..%g,%g tex0=%016llX",
+                    ps2_gs_frame_count,n,st->tme,st->zte,st->ztst,v[0].z,
+                    x0,x1,y0,y1,v[0].r,v[0].g,v[0].b,
+                    v[0].s,v[0].t,v[n-1].s,v[n-1].t,(unsigned long long)tex0_reg());
+        }
+        if (ws_marker_frame != ps2_gs_frame_count) {
+            ws_marker_frame = ps2_gs_frame_count;
+            ws_mcur ^= 1u;
+            ws_nmarker[ws_mcur] = 0;
+        }
+        if (!realz && v[0].z >= 0.99999f && st->tme && st->fst
+            && n == 6 && x1 - x0 < (float)st->fb_w * 0.5f && y1 - y0 < 64.0f)
+            ws_flight_frame = ps2_gs_frame_count;
+        if (st->zte && st->ztst != 1u) {
+            /* a target box or label (at the far plane or at the target's own
+               depth): placed by the widened camera, left alone; remembered
+               so the lock cues beside it stay with it */
+            u32 m = ws_nmarker[ws_mcur];
+            if (m < WS_MARKERS && v[0].z != 0.0f && x1 - x0 <= 128.0f && y1 - y0 <= 128.0f
+                && (!realz || (n == 2 && !st->tme))) {   /* at depth: box lines only */
+                ws_marker[ws_mcur][m][0] = x0; ws_marker[ws_mcur][m][1] = x1;
+                ws_marker[ws_mcur][m][2] = y0; ws_marker[ws_mcur][m][3] = y1;
+                ws_nmarker[ws_mcur] = m + 1u;
+            }
+            return;
+        }
+        if (realz) return;
+    }
+    /* The lock-on arrow and seeker diamond are drawn at the target's
+       projected position but without the depth test, so nothing else marks
+       them as world-anchored.  The diamond is red (lines, triangles or a
+       sprite, depending on the view) wherever it is on its way from the
+       centre to the target; the radar's red shapes are scissored, and red
+       text (captions, speaker names, the WARNING sign) is drawn with sprites. */
+    {   float sx = 512.0f / (float)st->fb_w, cyn = (y0 + y1) * 0.5f, cxn = (x0 + x1) * 0.5f * sx;
+        int warning = n == 6 && cxn > 192.0f && cxn < 320.0f && cyn > 136.0f && cyn < 180.0f;
+        if (ws_seeker_sprite(st, v, n)
+            || (v[0].z != 0.0f && !(n == 2 && (x1 - x0 < 0.5f || y1 - y0 < 0.5f))
+            && st->scissor[0] == 0 && v[0].r > 1.5f * v[0].g + 8.0f
+            && x1 - x0 <= 96.0f && y1 - y0 <= 96.0f && !(n == 6 && cyn < 104.0f) && !warning)) {
+            gs_stat_ws_cue++;
+            return;
+        }
+    }
+    /* the arrow: small untextured shapes touching a target box of this frame
+       or the last (the boxes come later in the frame) */
+    if (v[0].z != 0.0f && !st->tme && n != 6 && x1 - x0 <= 64.0f && y1 - y0 <= 64.0f && st->scissor[0] == 0
+        && !(n == 2 && (x1 - x0 < 0.5f || y1 - y0 < 0.5f)))   /* not tape ticks */
+        for (u32 b = 0; b < 2u; b++)
+            for (u32 m = 0; m < ws_nmarker[b]; m++) {
+                const float *r4 = ws_marker[b][m];
+                if (x1 >= r4[0] - 24.0f && x0 <= r4[1] + 24.0f
+                    && y1 >= r4[2] - 24.0f && y0 <= r4[3] + 24.0f) {
+                    gs_stat_ws_cue++;
+                    return;
+                }
+            }
+    gx = (float)st->fb_w * 0.5f;
+    /* The hangar's crosshair guides span the menu. They must transform with
+       its selector, unlike full-screen copies, fades and clearing strips. */
+    int menu_line = n == 2 && !st->tme && v[0].z == 0.0f;
+    /* The objectives screen's scan spans all 512 columns, unlike its tiled
+       background. Ordinary indexed Z-zero UI sprites share the menu layout
+       even at full width. RT copies and high-plane feedback were excluded
+       above; untextured clears/fades remain full width. Do not enable the
+       presentation pillarbox for 512-column flight to hide this UI effect. */
+    int menu_sprite = n == 6 && st->tme && st->fst && v[0].z == 0.0f
+                      && (psm == 19u || psm == 20u); /* PSMT8 / PSMT4 */
+    if (x0 <= 1.0f && x1 >= (float)st->fb_w - 0.5f
+        && !menu_sprite && !(menu_line && y1 - y0 < 0.5f)) return;
+    if (!st->tme && y0 <= 1.0f && y1 >= (float)st->fb_h - 0.5f
+        && !(menu_line && x1 - x0 < 0.5f)) return;
+    s = (4.0f / 3.0f) / aspect;
+    cx = gx + 0.5f;
+    /* "corners at the edges": the flight HUD's corner blocks keep their 4:3
+       shape but sit against the screen's sides: score and target count and
+       the radar on the left, time, weapons and damage on the right.  The
+       tapes, pitch ladder, captions and menus (Z 0) stay centred.  The blocks
+       are recognised by where they sit on AC4's 512 x 448 layout; the speed
+       and altitude tapes' numbers scroll into the radar's and the weapon
+       list's rows, so there only pieces the tapes never have (their own
+       scissor, wide labels, the radar's 8 x 8 corners) or rows below the
+       tapes count.  The pitch ladder turns but stays within ~150 pixels of
+       the centre, short of every block. */
+    edge = 0;
+    if (ps2_cfg.hud_layout == PS2_HUD_EDGES && v[0].z != 0.0f) {
+        float sx = 512.0f / (float)st->fb_w;
+        float nx = (x0 + x1) * 0.5f * sx, ny = (y0 + y1) * 0.5f, w = (x1 - x0) * sx;
+        /* The radar and the enlarged radar map (Square) draw their contents
+           and frame clipped to their own scissor at the left; all of it goes
+           to the left edge together.  While the big map is up (this frame or
+           the last) the position rules for the small radar's unclipped
+           pieces are off, since the speed tape's numbers run past it. */
+        int clipped = st->scissor[0] > 0 && st->scissor[0] < 40 && st->scissor[1] < 256;
+        if (clipped && st->scissor[1] - st->scissor[0] > 140) ws_bigmap_frame = ps2_gs_frame_count;
+        int bigmap = ps2_gs_frame_count - ws_bigmap_frame <= 1u;
+        if (clipped) edge = -1;                                   /* radar, map */
+        else if (ny < 56.0f && nx < 165.0f) edge = -1;            /* PTS, TGT */
+        else if (ny < 46.0f && nx > 360.0f) edge = 1;             /* TIME */
+        else if (!bigmap && ny > 284.0f && nx < 140.0f
+                 && (nx < 90.0f || ny > 345.0f || st->scissor[0] > 0
+                     || (w >= 7.5f && w <= 8.5f && y1 - y0 >= 7.5f && y1 - y0 <= 8.5f
+                         && nx > 118.0f)))
+            edge = -1;                                            /* radar */
+        else if (ny > 288.0f && nx > 384.0f
+                 && (nx > 434.0f || ny > 345.0f || (st->tme && w > 20.0f)))
+            edge = 1;                                             /* weapons, damage */
+    }
+    if (n == 6 && st->tme && st->fst && !st->shuffle_rg && !(v[0].round_uv & PS2_VK_RUV_CLAMP)) {
+        /* A point-sampled sprite loses its pixel-exact placement here, so with
+           smoothed UI (or any filtering at the new size) it would pick up the
+           neighbouring glyphs of its font page as faint lines.  Keep it inside
+           the texels it covers at native resolution, as bilinear sprites are. */
+        u32 cu, cv;
+        if (sprite_clamp_axis(v[0].x, v[2].x, v[0].s, v[2].s, &cu)
+            && sprite_clamp_axis(v[0].y, v[2].y, v[0].t, v[2].t, &cv))
+            for (k = 0; k < n; k++) {
+                v[k].round_uv |= PS2_VK_RUV_CLAMP;
+                v[k].clamp_u = cu;
+                v[k].clamp_v = cv;
+            }
+    }
+    if (v[0].z == 0.0f && st->tme) {
+        /* a menu, briefing or movie fills the 4:3 middle with its own picture:
+           the presentation then shows black at the sides instead of whatever
+           was left there (ps2_video.c) */
+        if (ws_area_frame != ps2_gs_frame_count) {
+            ws_area_frame = ps2_gs_frame_count;
+            ws_area = 0.0f;
+        }
+        ws_area += (x1 - x0) * (y1 - y0);
+        if (ws_area > 0.35f * (float)st->fb_w * (float)st->fb_h)
+            ps2_ws_pillar_frame = ps2_gs_frame_count;
+    }
+    for (k = 0; k < n; k++) {
+        v[k].x = ws_map(v[k].x, edge, s, cx, (float)st->fb_w);
+        v[k].round_uv &= PS2_VK_RUV_SPRITE | PS2_VK_RUV_CLAMP;
+    }
+    if (st->tex_point) st->tex_point = 2;
+    {   /* debugging: PS2_TRACE_WS=N[:M] logs each primitive kept 4:3 in fields N..M */
+        static long at = -2, to;
+        u64 vb;
+        if (at == -2) {
+            const char *e = getenv("PS2_TRACE_WS");
+            char *end = NULL;
+            at = e ? strtol(e, &end, 0) : -1;
+            to = end && *end == ':' ? strtol(end + 1, NULL, 0) : at + 1;
+        }
+        vb = at >= 0 ? ps2_kernel_vblank_count() : 0u;
+        if (at >= 0 && vb >= (u64)at && vb <= (u64)to)
+            ps2_log("ws: v%llu path%d prim%u n%d tme%d tex0 %016llX x[%.1f..%.1f] y[%.1f..%.1f] "
+                    "z%.0f fb%ux%u mask%08X shuffle%d zcopy%d", (unsigned long long)vb, GS_PATH,
+                    (unsigned)(gs_prim & 7u), n, st->tme, (unsigned long long)tex0_reg(),
+                    x0, x1, v[0].y, v[n - 1].y, v[0].z, st->fb_w, st->fb_h,
+                    st->fb_mask, st->shuffle_rg, st->zcopy);
+    }
+    l = ws_map((float)st->scissor[0], edge, s, gx, (float)st->fb_w);
+    r = ws_map((float)st->scissor[1] + 1.0f, edge, s, gx, (float)st->fb_w);
+    st->scissor[0] = (s32)floorf(l);
+    st->scissor[1] = (s32)ceilf(r) - 1;
+    gs_stat_ws_hud++;
+}
+
+static void vk_triangle_draw(const gs_vtx *a, const gs_vtx *b, const gs_vtx *c) {
+    ps2_vk_state st;
+    ps2_vk_vertex v[3];
+    int iip = (gs_prim & PRIM_IIP) ? 1 : 0;
+    fill_state(&st);
+    vk_vertex(&v[0], a, iip, c, st.fst, st.tex_lod);
+    vk_vertex(&v[1], b, iip, c, st.fst, st.tex_lod);
+    vk_vertex(&v[2], c, iip, c, st.fst, st.tex_lod);
+    draw_census(&st, v, 3);
+    ws_hud(&st, v, 3);
+    ps2_vk_draw(PS2_VK_TRIANGLES, &st, v, 3);
+}
+
+static void vk_triangle(const gs_vtx *a, const gs_vtx *b, const gs_vtx *c) {
+    int lo, hi;
+    if (gs_tri_mip_range(a, b, c, &lo, &hi)) {
+        u32 base = gs_dyn_mip;
+        for (int n = lo; n <= hi; n++) {
+            gs_dyn_lod = n;
+            gs_dyn_mip = base | ((u32)n << 14);
+            vk_triangle_draw(a, b, c);
+        }
+        gs_dyn_mip = 0;
+    } else {
+        gs_prim_lod(a, b, c);
+        vk_triangle_draw(a, b, c);
+    }
+    gs_dyn_lod = -1;
+    gs_stat_prims++;
+}
+
+/* Render targets keep alpha as a / 128 in an 8-bit channel, so the alpha
+   bytes above 0x80 that PSMT8H indices need do not survive there.  AC4
+   builds terrain tiles by writing palette indices into a 64x64 target's alpha
+   (a textured sprite with RGB masked: mission 09's cloud shadows) and copying
+   them into the terrain atlas as PSMT8H.  So the alpha a sprite writes into a
+   32-bit target is also written to VRAM, here, with the full byte; when every
+   alpha write into the target went this way, trx_local_echo leaves the copy
+   to VRAM.  Sprites only: one colour, linear UV.  PS2_NO_CPU_ALPHA=1 skips. */
+static void cpu_alpha_sprite(const ps2_vk_state *st, const gs_vtx *a,
+                             const gs_vtx *b) {
+    static int off = -1;
+    u64 t0 = tex0_reg();
+    u32 fbp = fb_base(), fbw = fb_width(), tpsm = (u32)((t0 >> 20) & 0x3Full);
+    u32 tbp = (u32)(t0 & 0x3FFFull) * 256u, tbw = (u32)((t0 >> 14) & 0x3Full) * 64u;
+    u32 tw = 1u << ((t0 >> 26) & 0xFull), th = 1u << ((t0 >> 30) & 0xFull);
+    u32 cpsm = (u32)((t0 >> 51) & 0xFull), af = b->rgba >> 24;
+    s32 xa, xb, ya, yb, px, py, x0, x1, y0, y1;
+    float ua, ub, va, vb;
+    int indexed;
+    if (off < 0) {
+        const char *e = getenv("PS2_NO_CPU_ALPHA");
+        off = (e && *e && *e != '0') ? 1 : 0;
+    }
+    /* RGB masked: the draw writes only indices.  A draw that writes colour
+       too would leave VRAM half old, half new (and colour is not mirrored) */
+    if (off || st->rt >= GS_RT_SLOTS || st->fb_psm != PSM_CT32
+        || st->fb_mask != 0x00FFFFFFu || !fbw || st->date
+        || (st->ate && st->atst != 1u) || (st->zte && st->ztst != 1u)
+        || st->tex_rt || st->index_rt || st->shuffle_rg || st->tex_depth)
+        return;   /* (texels only on the GPU: the echo handles those) */
+    indexed = psm_is_indexed(tpsm);
+    if (st->tme && st->tcc) {
+        if (indexed ? (cpsm != PSM_CT32) : (tpsm != PSM_CT32)) return;
+        if (!tbw) tbw = 64u;
+    }
+    xa = a->x < b->x ? a->x : b->x; xb = a->x < b->x ? b->x : a->x;
+    ya = a->y < b->y ? a->y : b->y; yb = a->y < b->y ? b->y : a->y;
+    if (xb - xa > 2048 * 16 || yb - ya > 2048 * 16 || xb <= xa || yb <= ya) return;
+    x0 = (xa + 15) >> 4; x1 = (xb + 15) >> 4;   /* pixels [x0, x1) */
+    y0 = (ya + 15) >> 4; y1 = (yb + 15) >> 4;
+    if (x0 < st->scissor[0]) x0 = st->scissor[0];
+    if (x1 > st->scissor[1] + 1) x1 = st->scissor[1] + 1;
+    if (y0 < st->scissor[2]) y0 = st->scissor[2];
+    if (y1 > st->scissor[3] + 1) y1 = st->scissor[3] + 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (st->fst) {
+        ua = (float)a->u / 16.0f; ub = (float)b->u / 16.0f;
+        va = (float)a->v / 16.0f; vb = (float)b->v / 16.0f;
+    } else {
+        float qa = a->q != 0.0f ? a->q : 1.0f, qb = b->q != 0.0f ? b->q : 1.0f;
+        ua = a->s / qa * (float)tw; ub = b->s / qb * (float)tw;
+        va = a->t / qa * (float)th; vb = b->t / qb * (float)th;
+    }
+    for (py = y0; py < y1; py++) {
+        /* texel at the pixel centre, as the GPU samples it */
+        float fy = ((float)py + 0.5f - (float)a->y / 16.0f) / ((float)(b->y - a->y) / 16.0f);
+        s32 v = (s32)floorf(va + (vb - va) * fy);
+        if (v < 0) v = 0;
+        if (v >= (s32)th) v = (s32)th - 1;
+        for (px = x0; px < x1; px++) {
+            u32 at = 0, out, old;
+            if (st->tme && st->tcc) {
+                float fx = ((float)px + 0.5f - (float)a->x / 16.0f)
+                         / ((float)(b->x - a->x) / 16.0f);
+                s32 u = (s32)floorf(ua + (ub - ua) * fx);
+                if (u < 0) u = 0;
+                if (u >= (s32)tw) u = (s32)tw - 1;
+                at = indexed ? clut_entry(vram_get(tbp, tbw, (u32)u, (u32)v, tpsm)) >> 24
+                             : vram_get(tbp, tbw, (u32)u, (u32)v, tpsm) >> 24;
+                switch (st->tfx) {
+                case 0:  out = (at * af) >> 7; break;     /* modulate */
+                case 2:  out = at + af; break;            /* highlight */
+                default: out = at; break;                 /* decal, highlight2 */
+                }
+            } else {
+                out = af;
+            }
+            if (out > 255u) out = 255u;
+            if (st->fba) out |= 0x80u;
+            old = vram_get(fbp, fbw, (u32)px, (u32)py, PSM_CT32);
+            vram_put(fbp, fbw, (u32)px, (u32)py, PSM_CT32, (old & 0x00FFFFFFu) | (out << 24));
+        }
+    }
+    gs_rt_cpu_alpha[st->rt] = 1;
+    if (getenv("PS2_TRACE_CPU_ALPHA")) {
+        static u32 said;
+        if (said++ < 400u)
+            ps2_log("cpu-alpha: field %u rt%u fbp=%u fbw=%u [%d..%d)x[%d..%d) tme%u tcc%u "
+                    "tfx%u tpsm%u tbp=%u af=%u mask=%08X", ps2_gs_frame_count, st->rt,
+                    fbp, fbw, x0, x1, y0, y1, st->tme, st->tcc, st->tfx, tpsm, tbp, af,
+                    st->fb_mask);
+    }
+}
+
+static void vk_sprite(const gs_vtx *a, const gs_vtx *b) {
+    ps2_vk_state st;
+    ps2_vk_vertex q[4], t[6];
+    int i;
+    gs_prim_lod(a, b, NULL);
+    fill_state(&st);
+    gs_dyn_lod = -1;
+    vk_vertex(&q[0], a, 0, b, st.fst, st.tex_lod);
+    vk_vertex(&q[2], b, 0, b, st.fst, st.tex_lod);
+    if (st.tex_self && st.fst && st.fb_psm == PSM_CT16S
+        && ((tex0_reg() >> 20) & 63u) == PSM_CT16S
+        && st.tfx == 1u && st.tcc && !st.abe && !st.ate && !st.date
+        && !st.zwrite && !st.fb_mask && !st.fba
+        && st.wms == 3u && st.wmt == 3u && st.minu == 1015u
+        && st.maxu == 0u && st.minv == 1023u && st.maxv == 0u
+        && ((tex0_reg() >> 14) & 63u) * 64u == st.fb_w
+        && (a->x & 1023) == 0 && (a->y & 1023) == 0
+        /* strips end at 63.5 px (AC5) or exactly 64 px (AC4's self-shadow):
+           both cover the same 64 columns */
+        && ((b->x & 1023) == 1016 || ((b->x & 1023) == 0 && b->x - a->x == 1024))
+        && (b->y & 1023) == 0
+        && b->x > a->x && b->y > a->y
+        && a->u == a->x + 8 && b->u == b->x + 8
+        && a->v == a->y + 8 && b->v == b->y + 8) {
+        st.shuffle_rg = 1;
+        st.shuffle_alpha = (u32)((gs_reg[GS_TEXA] >> 7) & 1u)
+                         | (u32)(((gs_reg[GS_TEXA] >> 39) & 1u) << 1)
+                         | (u32)(((gs_reg[GS_TEXA] >> 15) & 1u) << 2);
+        q[0].x = (float)a->x / 16.0f;
+        q[2].x = ((float)b->x + ((b->x & 1023) ? 8.0f : 0.0f)) / 16.0f;
+        q[0].y = (float)a->y / 32.0f;
+        q[2].y = (float)b->y / 32.0f;
+        st.scissor[2] /= 2;
+        st.scissor[3] /= 2;
+    }
+    q[1] = q[0]; q[1].x = q[2].x; q[1].s = q[2].s;
+    q[3] = q[2]; q[3].x = q[0].x; q[3].s = q[0].s;
+    for (i = 0; i < 4; i++) {
+        q[i].z = q[2].z;
+        q[i].r = q[2].r; q[i].g = q[2].g; q[i].b = q[2].b; q[i].a = q[2].a;
+        q[i].q = q[2].q;
+        q[i].fog = q[2].fog;
+    }
+    if (q[2].x > q[0].x) {
+        float x0 = q[0].x, x1 = q[2].x;
+        float p0 = ceilf(x0 - 0.5f), p1 = ceilf(x1 - 0.5f);
+        if (p1 > p0) {
+            float ds = (q[2].s - q[0].s) / (x1 - x0);
+            float s0 = q[0].s + (p0 - x0) * ds;
+            float s1 = q[2].s + (p1 - x1) * ds;
+            q[0].x = q[3].x = p0;  q[0].s = q[3].s = s0;
+            q[1].x = q[2].x = p1;  q[1].s = q[2].s = s1;
+        }
+    }
+
+    if (!st.shuffle_rg && st.tex_rt && st.fst && q[2].y > q[0].y && q[2].x > q[0].x
+        && !no_deinterlace && ps2_cfg.deinterlace) {
+        float sy = (q[2].t - q[0].t) / (q[2].y - q[0].y);
+        float sx = (q[2].s - q[0].s) / (q[2].x - q[0].x);
+        if (sy > 1.9f && sy < 2.1f && sx > 0.95f && sx < 1.05f) {
+            float off = q[0].t - (q[0].y - 0.5f) * sy;
+            if (off > -2.0f && off < 2.0f) {
+                int i;
+                for (i = 0; i < 4; i++) {
+                    q[i].t -= off;
+                    q[i].y = (q[i].y - 0.5f) * 2.0f + 0.5f;
+                }
+                st.scissor[2] *= 2;
+                st.scissor[3] = st.scissor[3] * 2 + 1;
+                st.fb_h = (u32)st.scissor[3] + 1u;
+                gs_stat_deint++;
+            }
+        }
+    }
+    t[0] = q[0]; t[1] = q[1]; t[2] = q[2];
+    t[3] = q[0]; t[4] = q[2]; t[5] = q[3];
+    for (i = 0; i < 6; i++) t[i].round_uv = PS2_VK_RUV_SPRITE;
+    if (st.tme && st.fst && !st.shuffle_rg) {
+        u32 cu, cv;
+        if (sprite_clamp_axis(q[0].x, q[2].x, q[0].s, q[2].s, &cu)
+            && sprite_clamp_axis(q[0].y, q[2].y, q[0].t, q[2].t, &cv))
+            for (i = 0; i < 6; i++) {
+                t[i].round_uv |= PS2_VK_RUV_CLAMP;
+                t[i].clamp_u = cu;
+                t[i].clamp_v = cv;
+            }
+    }
+    if (st.tme && st.fst && st.tex_point && !st.shuffle_rg
+        && !st.tex_rt && !st.tex_lod) {
+        u32 ru = sprite_round_axis(a->x, b->x, a->u, b->u);
+        u32 rv = sprite_round_axis(a->y, b->y, a->v, b->v);
+        s32 ox = (a->x & 15) ? -2048 : a->x / 16;
+        s32 oy = (a->y & 15) ? -2048 : a->y / 16;
+        if (ox >= -2048 && ox < 2048 && oy >= -2048 && oy < 2048) {
+            u32 info = ru | (rv << 2) | ((u32)(ox + 2048) << 4)
+                       | ((u32)(oy + 2048) << 16) | (1u << 28);
+            for (i = 0; i < 6; i++) t[i].round_uv |= info;
+        }
+    }
+    if (st.tex_rt) {
+        u64 i = blitlog_n++ % BLITLOG_N;
+        blitlog[i].frame = ps2_gs_frame_count;
+        blitlog[i].dst = st.rt;
+        blitlog[i].src = st.tex_rt - 1u;
+        blitlog[i].y0 = q[0].y; blitlog[i].y1 = q[2].y;
+        blitlog[i].t0 = q[0].t; blitlog[i].t1 = q[2].t;
+        blitlog[i].x0 = q[0].x; blitlog[i].x1 = q[2].x;
+        blitlog[i].s0 = q[0].s; blitlog[i].s1 = q[2].s;
+    }
+    draw_census(&st, t, 6);
+    ws_hud(&st, t, 6);
+    ps2_vk_draw(PS2_VK_TRIANGLES, &st, t, 3);
+    ps2_vk_draw(PS2_VK_TRIANGLES, &st, t + 3, 3);
+    if (gs_rt_aepoch[st.rt < GS_RT_SLOTS ? st.rt : 0] == gs_epoch_seq && st.rt < GS_RT_SLOTS
+        && st.fb_w <= 256u && st.fb_h <= 256u)
+        cpu_alpha_sprite(&st, a, b);   /* small targets only: tile builders */
+    gs_stat_prims++;
+}
+
+static void vk_line(const gs_vtx *a, const gs_vtx *b) {
+    ps2_vk_state st;
+    ps2_vk_vertex v[2];
+    gs_prim_lod(a, b, NULL);
+    fill_state(&st);
+    gs_dyn_lod = -1;
+    vk_vertex(&v[0], a, (gs_prim & PRIM_IIP) ? 1 : 0, b, st.fst, st.tex_lod);
+    vk_vertex(&v[1], b, (gs_prim & PRIM_IIP) ? 1 : 0, b, st.fst, st.tex_lod);
+    draw_census(&st, v, 2);
+    ws_hud(&st, v, 2);
+    ps2_vk_draw(PS2_VK_LINES, &st, v, 2);
+    gs_stat_prims++;
+}
+
+static void vk_point(const gs_vtx *a) {
+    ps2_vk_state st;
+    ps2_vk_vertex v[1];
+    gs_prim_lod(a, NULL, NULL);
+    fill_state(&st);
+    gs_dyn_lod = -1;
+    vk_vertex(&v[0], a, 1, a, st.fst, st.tex_lod);
+    draw_census(&st, v, 1);
+    ws_hud(&st, v, 1);
+    ps2_vk_draw(PS2_VK_POINTS, &st, v, 1);
+    gs_stat_prims++;
+}
+
+static void vk_assemble(const gs_vtx *v) {
+    PS2_PHASE_BEGIN(PS2_PH_PRIM);
+    ps2_gs_prim_seq++;
+    switch (gs_prim & 7u) {
+    case PRIM_POINT:
+        vk_point(v);
+        gs_qn = 0;
+        break;
+    case PRIM_LINE:
+        if (gs_qn >= 2) { vk_line(&gs_queue[gs_qn - 2], &gs_queue[gs_qn - 1]);
+                          gs_qn = 0; }
+        break;
+    case PRIM_LINESTRIP:
+        if (gs_qn >= 2) {
+            vk_line(&gs_queue[gs_qn - 2], &gs_queue[gs_qn - 1]);
+            gs_queue[0] = gs_queue[gs_qn - 1];
+            gs_qn = 1;
+        }
+        break;
+    case PRIM_TRI:
+        if (gs_qn == 3) {
+            vk_triangle(&gs_queue[0], &gs_queue[1], &gs_queue[2]);
+            gs_qn = 0;
+        }
+        break;
+    case PRIM_TRISTRIP:
+        if (gs_qn == 3) {
+            vk_triangle(&gs_queue[0], &gs_queue[1], &gs_queue[2]);
+            gs_queue[0] = gs_queue[1];
+            gs_queue[1] = gs_queue[2];
+            gs_qn = 2;
+        }
+        break;
+    case PRIM_TRIFAN:
+        if (gs_qn == 3) {
+            vk_triangle(&gs_queue[0], &gs_queue[1], &gs_queue[2]);
+            gs_queue[1] = gs_queue[2];
+            gs_qn = 2;
+        }
+        break;
+    case PRIM_SPRITE:
+        if (gs_qn == 2) { vk_sprite(&gs_queue[0], &gs_queue[1]); gs_qn = 0; }
+        else if (gs_qn == 3) { vk_sprite(&gs_queue[1], &gs_queue[2]); gs_qn = 0; }
+        break;
+    default:
+        gs_qn = 0;
+        break;
+    }
+    PS2_PHASE_END(PS2_PH_PRIM);
+}
+
+int ps2_gs_present(void) {
+    return ps2_gfxq_field();
+}
+
+/* ---- shapes drawn by mods over the picture (ac4.draw_circle / draw_line) ----
+   A mod adds them on the EE thread for the field being issued; the GS thread
+   draws them into the displayed frame buffer just before that field is
+   presented, as ordinary GS triangles (so they scale with the internal
+   resolution, follow the widescreen stretch like the 3D scene and go into F7
+   videos).  Positions are PS2 pixels from the centre of the picture, the way
+   the game's own camera puts them (its screen centre is 2048,2048). */
+#define GS_OV_RING 16u
+#define GS_OV_MAX  48
+typedef struct { u8 kind; float a, b, c, d, thick; u32 rgba; } gs_ov_shape;
+typedef struct { u32 key; int n; gs_ov_shape s[GS_OV_MAX]; } gs_ov_set;
+static gs_ov_set gs_ov[GS_OV_RING];
+static int gs_ov_lockv, gs_ov_used, gs_ov_lag = -1000;
+extern u32 ps2_field_presenting;
+u32 ps2_field_issued(void);
+
+static void gs_ov_lock(void) {
+    while (__atomic_exchange_n(&gs_ov_lockv, 1, __ATOMIC_ACQUIRE)) { }
+}
+static void gs_ov_unlock(void) { __atomic_store_n(&gs_ov_lockv, 0, __ATOMIC_RELEASE); }
+
+/* kind 0 ring (a,b centre, c radius), 1 line (a,b)-(c,d), 2 filled disc */
+int ps2_gs_overlay_add(int kind, float a, float b, float c, float d, float thick, u32 rgba) {
+    u32 key;
+    gs_ov_set *set;
+    int ok = 0;
+    if (gs_ov_lag == -1000) {
+        const char *e = getenv("PS2_OVERLAY_LAG");      /* fields; for tuning */
+        gs_ov_lag = e ? atoi(e) : 0;
+    }
+    key = ps2_field_issued() + (u32)gs_ov_lag;
+    gs_ov_lock();
+    set = &gs_ov[key % GS_OV_RING];
+    if (set->key != key) { set->key = key; set->n = 0; }
+    if (set->n < GS_OV_MAX) {
+        gs_ov_shape *s = &set->s[set->n++];
+        s->kind = (u8)kind; s->a = a; s->b = b; s->c = c; s->d = d;
+        s->thick = thick; s->rgba = rgba;
+        ok = 1;
+    }
+    gs_ov_unlock();
+    __atomic_store_n(&gs_ov_used, 1, __ATOMIC_RELAXED);
+    return ok;
+}
+
+static void gs_ov_vertex(float x, float y) {
+    s32 xi = (s32)lrintf(x * 16.0f), yi = (s32)lrintf(y * 16.0f);
+    if (xi < 0) xi = 0;
+    if (yi < 0) yi = 0;
+    if (xi > 0xFFFF) xi = 0xFFFF;
+    if (yi > 0xFFFF) yi = 0xFFFF;
+    ps2_gs_write_reg(GS_XYZ2, (u64)(u32)xi | ((u64)(u32)yi << 16));
+}
+
+static void gs_ov_draw(u64 fb, u32 dbx, u32 dby, u32 dw, u32 dh, int slot) {
+    static const u8 regs[] = { GS_FRAME_1, GS_XYOFFSET_1, GS_SCISSOR_1, GS_TEST_1, GS_ZBUF_1,
+                               GS_ALPHA_1, GS_FBA_1, GS_PABE, GS_DTHE, GS_COLCLAMP,
+                               GS_PRMODECONT, GS_PRMODE, GS_RGBAQ, GS_PRIM };
+    static int last_slot = -1;
+    static u32 last_drawn;
+    gs_ov_shape sh[GS_OV_MAX];
+    u64 saved[sizeof regs];
+    u32 key = ps2_field_presenting, psm;
+    int n = 0;
+    float cx, cy;
+    gs_ov_lock();
+    if (gs_ov[key % GS_OV_RING].key == key) {
+        n = gs_ov[key % GS_OV_RING].n;
+        memcpy(sh, gs_ov[key % GS_OV_RING].s, (size_t)n * sizeof sh[0]);
+    }
+    gs_ov_unlock();
+    if (!n || slot < 0 || slot >= GS_RT_SLOTS) return;
+    /* the game shows this buffer again without drawing into it: it already
+       has the shapes (a second copy would stay where the first was) */
+    if (slot == last_slot && gs_rt_drawn[slot] == last_drawn) return;
+    for (size_t i = 0; i < sizeof regs; i++) saved[i] = gs_reg[regs[i]];
+    psm = (u32)((fb >> 15) & 0x1Full);
+    gs_ov_drawing = 1;
+    ps2_gs_write_reg(GS_FRAME_1, (fb & 0x1FFull) | (((fb >> 9) & 0x3Full) << 16)
+                     | ((u64)psm << 24) | ((psm == PSM_CT32 ? 0xFF000000ull : 0ull) << 32));
+    ps2_gs_write_reg(GS_XYOFFSET_1, 0);
+    ps2_gs_write_reg(GS_SCISSOR_1, (u64)dbx | ((u64)(dbx + dw - 1u) << 16)
+                     | ((u64)dby << 32) | ((u64)(dby + dh - 1u) << 48));
+    ps2_gs_write_reg(GS_TEST_1, (1ull << 16) | (1ull << 17));     /* Z test: always */
+    ps2_gs_write_reg(GS_ZBUF_1, saved[4] | (1ull << 32));          /* no Z writes */
+    ps2_gs_write_reg(GS_ALPHA_1, 0x44);                             /* (Cs-Cd)*As+Cd */
+    ps2_gs_write_reg(GS_FBA_1, 0);
+    ps2_gs_write_reg(GS_PABE, 0);
+    ps2_gs_write_reg(GS_DTHE, 0);
+    ps2_gs_write_reg(GS_COLCLAMP, 1);
+    ps2_gs_write_reg(GS_PRMODECONT, 1);
+    cx = (float)dbx + (float)dw * 0.5f;
+    cy = (float)dby + (float)dh * 0.5f;
+    for (int i = 0; i < n; i++) {
+        const gs_ov_shape *s = &sh[i];
+        float t = s->thick > 0.1f ? s->thick : 1.0f;
+        ps2_gs_write_reg(GS_PRIM, PRIM_TRISTRIP | PRIM_ABE);
+        ps2_gs_write_reg(GS_RGBAQ, (u64)s->rgba | (0x3F800000ull << 32));
+        if (s->kind == 1) {
+            float x0 = cx + s->a, y0 = cy + s->b, x1 = cx + s->c, y1 = cy + s->d;
+            float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy);
+            if (l < 0.01f) continue;
+            dx *= t * 0.5f / l; dy *= t * 0.5f / l;
+            gs_ov_vertex(x0 - dy, y0 + dx); gs_ov_vertex(x0 + dy, y0 - dx);
+            gs_ov_vertex(x1 - dy, y1 + dx); gs_ov_vertex(x1 + dy, y1 - dx);
+        } else {
+            float r = s->c, ro = s->kind == 2 ? r : r + t * 0.5f;
+            float ri = s->kind == 2 ? 0.0f : fmaxf(0.0f, r - t * 0.5f);
+            int seg = r < 6.0f ? 16 : r < 20.0f ? 24 : 40;
+            for (int k = 0; k <= seg; k++) {
+                float ang = (float)k * 6.2831853f / (float)seg, co = cosf(ang), si = sinf(ang);
+                gs_ov_vertex(cx + s->a + co * ro, cy + s->b + si * ro);
+                gs_ov_vertex(cx + s->a + co * ri, cy + s->b + si * ri);
+            }
+        }
+    }
+    for (size_t i = 0; i < sizeof regs; i++) ps2_gs_write_reg(regs[i], saved[i]);
+    gs_ov_drawing = 0;
+    last_slot = slot;
+    last_drawn = gs_rt_drawn[slot];
+}
+
+int ps2_gs_present_now(void) {
+    u64 fb;
+    fb = dispfb_reg();
+    u32 dw = ps2_gs_display_width(), dh = ps2_gs_display_height();
+    u32 dbx = (u32)((fb >> 32) & 0x7FFull);
+    u32 dby = (u32)((fb >> 43) & 0x7FFull);
+    u32 base = (u32)(fb & 0x1FFull) * 2048u * 4u;
+    int slot;
+    ps2_gs_frame_count++;
+    rn_dump_frame();
+    {   /* PS2_VRAM_EXPORT=field:base:bufw:psm:w:h -- writes that area of GS
+           memory as a linear grey image (vram_<base>_<psm>.pgm), read through
+           the GS's own addressing: for studying fonts and glyph caches */
+        static int parsed;
+        static unsigned long ex[6];
+        if (!parsed) {
+            const char *e = getenv("PS2_VRAM_EXPORT");
+            parsed = 1;
+            if (e && sscanf(e, "%lu:%lu:%lu:%lu:%lu:%lu", &ex[0], &ex[1], &ex[2],
+                            &ex[3], &ex[4], &ex[5]) != 6) ex[0] = 0;
+        }
+        if (ex[0] && ps2_gs_frame_count == ex[0]) {
+            char nm[96];
+            FILE *fp;
+            u32 bits = psm_bits((u32)ex[3]);
+            snprintf(nm, sizeof nm, "vram_%lu_%lu.pgm", ex[1], ex[3]);
+            fp = fopen(nm, "wb");
+            if (fp) {
+                fprintf(fp, "P5\n%lu %lu\n255\n", ex[4], ex[5]);
+                for (u32 y = 0; y < ex[5]; y++)
+                    for (u32 x = 0; x < ex[4]; x++) {
+                        u32 v = vram_get((u32)ex[1], (u32)ex[2], x, y, (u32)ex[3]);
+                        fputc(bits == 4 ? (int)(v * 17u) : (int)(v & 0xFFu), fp);
+                    }
+                fclose(fp);
+                ps2_log("vram export: %s", nm);
+            }
+        }
+    }
+    ps2_cap_present();
+    ps2_cap_maybe_start();
+    if (ps2_statecap_gs_pending()) {
+        ps2_gs_statecap(ps2_statecap_dir());
+        ps2_statecap_gs_done();
+    }
+    if (!ps2_vk_enabled()) return !ps2_vk_closed();
+    if (!dw || dw > 2048) dw = 640;
+    if (!dh || dh > 2048) dh = 448;
+    gs_disp_base = base;
+    if (PS2_ENV("PS2_TRACE_DISP")) {
+        static u64 last, last2;
+        u64 fb1 = ps2_gs_priv_read(0x12000070u);
+        u64 fb2 = ps2_gs_priv_read(0x12000090u);
+        u64 pm  = ps2_gs_priv_read(0x12000000u);
+        u64 key = (fb << 8) | (u64)(dw & 0xFFu);
+        u64 key2 = fb1 ^ (fb2 * 3ull) ^ (pm << 1);
+        if (key != last || key2 != last2) {
+            u64 d = display_reg();
+            last = key; last2 = key2;
+            ps2_log("disp: frame %llu  DISPFB base=%u fbw=%u psm=%u "
+                    "dbx=%u dby=%u | DISPLAY dx=%u dy=%u magh=%u magv=%u "
+                    "dw=%u dh=%u | shown %ux%u | PMODE=%llX circuit=%d "
+                    "DISPFB1=%llX DISPFB2=%llX",
+                    (unsigned long long)ps2_gs_frame_count, base,
+                    (u32)((fb >> 9) & 0x3Full) * 64u,
+                    (u32)((fb >> 15) & 0x1Full), dbx, dby,
+                    (u32)(d & 0x7FFull), (u32)((d >> 12) & 0x7FFull),
+                    (u32)((d >> 23) & 0xFull) + 1u,
+                    (u32)((d >> 27) & 3ull) + 1u,
+                    (u32)((d >> 32) & 0xFFFull) + 1u,
+                    (u32)((d >> 44) & 0x7FFull) + 1u, dw, dh,
+                    (unsigned long long)pm, (pm & 2ull) ? 2 : 1,
+                    (unsigned long long)fb1, (unsigned long long)fb2);
+        }
+    }
+    slot = rt_find(base);
+    {
+        static int keep = -1;
+        int stale = slot < 0;
+        if (keep < 0) keep = PS2_ENV("PS2_DISPLAY_STALE") ? 1 : 0;
+        if (!stale && gs_rt_field[slot] + 2u < ps2_gs_frame_count) {
+            u32 s0 = gs_rt_base[slot];
+            u32 s1 = s0 + (gs_rt_field_pages[slot] ? gs_rt_field_pages[slot] : 1u) * GS_PAGE_BYTES;
+            for (u32 i = 0; i < gs_rt_n && !stale; i++) {
+                u32 t0, t1;
+                if ((int)i == slot || gs_rt_epoch[i] <= gs_rt_epoch[slot]) continue;
+                t0 = gs_rt_base[i];
+                t1 = t0 + (gs_rt_field_pages[i] ? gs_rt_field_pages[i] : 1u) * GS_PAGE_BYTES;
+                stale = t0 < s1 && s0 < t1;
+            }
+        }
+        if (stale && !keep) {
+            static u32 said;
+            if (said++ < 8u)
+                ps2_log("gs: field %u shows base %u, which holds nothing current "
+                        "(%s) -- black", ps2_gs_frame_count, base,
+                        slot < 0 ? "never a target" : "written over since it was drawn");
+            return ps2_vk_present(dbx, dby, dw, dh, PS2_VK_PRESENT_BLANK);
+        }
+    }
+    {
+        static int tp = -1;
+        if (tp < 0) tp = PS2_ENV("PS2_TRACE_PRESENT") ? 1 : 0;
+        if (tp && (slot < 0 || gs_rt_field[slot] + 2u < ps2_gs_frame_count)) {
+            static u32 shown;
+            if (shown++ < 400u)
+                ps2_log("present: field %u DISPFB base %u -> %s%d, last drawn field %u",
+                        ps2_gs_frame_count, base, slot < 0 ? "no slot, showing slot " : "slot ",
+                        slot < 0 ? 0 : slot, slot < 0 ? gs_rt_field[0] : gs_rt_field[slot]);
+        }
+    }
+    if (__atomic_load_n(&gs_ov_used, __ATOMIC_RELAXED))
+        gs_ov_draw(fb, dbx, dby, dw, dh, slot);
+    return ps2_vk_present(dbx, dby, dw, dh, slot < 0 ? 0u : (u32)slot);
+}
+
+void ps2_gs_write_reg(u32 reg, u64 val) {
+    if (g_cap_shallow) ps2_cap_reg(reg, val);
+    if (PS2_UNLIKELY(rn_dump_on)) rn_dump_gsreg(reg, val);
+    gs_stat_regs++;
+    if (PS2_UNLIKELY(reg >= GS_BITBLTBUF && reg <= GS_TRXDIR)
+        && PS2_ENV("PS2_TRACE_TRXREGS")) {
+        static u32 said;
+        static long from = -1, want_dbp = -1;
+        if (from < 0) {
+            const char *e = getenv("PS2_TRACE_TRXREGS_FROM");   /* first field */
+            const char *d = getenv("PS2_TRACE_TRXREGS_DBP");    /* only this DBP */
+            from = e ? strtol(e, NULL, 0) : 0;
+            want_dbp = d ? strtol(d, NULL, 0) : -1;
+        }
+        if (reg == GS_TRXDIR && want_dbp >= 0) {
+            u64 bb = gs_reg[GS_BITBLTBUF], pos = gs_reg[GS_TRXPOS], rg = gs_reg[GS_TRXREG];
+            if ((long)ps2_gs_frame_count >= from && (long)((bb >> 32) & 0x3FFFu) == want_dbp
+                && said++ < 4000u)
+                ps2_log("trx: field %u dir %u  src bp %llX bw %llu psm %llX (%llu,%llu)  ->  "
+                        "dst bp %llX bw %llu psm %llX (%llu,%llu)  %llux%llu",
+                        ps2_gs_frame_count, (u32)(val & 3u),
+                        bb & 0x3FFFu, (bb >> 16) & 0x3Fu, (bb >> 24) & 0x3Fu,
+                        pos & 0x7FFu, (pos >> 16) & 0x7FFu,
+                        (bb >> 32) & 0x3FFFu, (bb >> 48) & 0x3Fu, (bb >> 56) & 0x3Fu,
+                        (pos >> 32) & 0x7FFu, (pos >> 48) & 0x7FFu,
+                        rg & 0xFFFu, (rg >> 32) & 0xFFFu);
+        } else if (want_dbp < 0 && (long)ps2_gs_frame_count >= from && said++ < 4000u)
+            ps2_log("trxreg: field %u %s = %016llX", ps2_gs_frame_count,
+                    reg == GS_BITBLTBUF ? "BITBLTBUF" : reg == GS_TRXPOS ? "TRXPOS"
+                    : reg == GS_TRXREG ? "TRXREG" : "TRXDIR",
+                    (unsigned long long)val);
+    }
+    if (reg < 0x64) {
+        gs_reg_hist[reg]++;
+        if (gs_reg[reg] != val && !gs_reg_is_data[reg]) gs_state_ver++;
+        gs_reg[reg] = val;
+    }
+    switch (reg) {
+    case GS_PRIM:
+        gs_qn = 0;
+        gs_strip_parity = 0;
+        __attribute__((fallthrough));
+    case GS_PRMODE:
+    case GS_PRMODECONT:
+        gs_prim = (u32)(gs_reg[GS_PRIM] & 7u) |
+            (u32)(gs_reg[(gs_reg[GS_PRMODECONT] & 1u) ? GS_PRIM : GS_PRMODE] & 0x7F8u);
+        break;
+    case GS_RGBAQ: {
+        u32 q32 = (u32)(val >> 32);
+        gs_rgba = (u32)val;
+        memcpy(&gs_q, &q32, 4);
+        break;
+    }
+    case GS_ST: {
+        u32 s32b = (u32)val, t32 = (u32)(val >> 32);
+        memcpy(&gs_st_s, &s32b, 4);
+        memcpy(&gs_st_t, &t32, 4);
+        break;
+    }
+    case GS_FOG:
+        gs_fog = (float)((val >> 56) & 0xFFull) / 255.0f;
+        break;
+    case GS_UV:
+        gs_u = (u16)(val & 0x3FFFull);
+        gs_v = (u16)((val >> 16) & 0x3FFFull);
+        break;
+    case GS_XYZF2:
+        gs_fog = (float)((val >> 56) & 0xFFull) / 255.0f;
+        vertex_kick((s32)(val & 0xFFFFull), (s32)((val >> 16) & 0xFFFFull),
+                    (u32)((val >> 32) & 0xFFFFFFull), 1);
+        break;
+    case GS_XYZF3:
+        gs_fog = (float)((val >> 56) & 0xFFull) / 255.0f;
+        vertex_kick((s32)(val & 0xFFFFull), (s32)((val >> 16) & 0xFFFFull),
+                    (u32)((val >> 32) & 0xFFFFFFull), 0);
+        break;
+    case GS_XYZ2:
+        vertex_kick((s32)(val & 0xFFFFull), (s32)((val >> 16) & 0xFFFFull),
+                    (u32)((val >> 32) & 0xFFFFFFFFull), 1);
+        break;
+    case GS_XYZ3:
+        vertex_kick((s32)(val & 0xFFFFull), (s32)((val >> 16) & 0xFFFFull),
+                    (u32)((val >> 32) & 0xFFFFFFFFull), 0);
+        break;
+    case GS_TRXDIR:
+        gs_trxdir_hist[val & 3ull]++;
+        if ((val & 3ull) == 0ull) trx_begin();
+        else if ((val & 3ull) == 2ull) trx_local();
+        break;
+    case GS_HWREG:
+        trx_data(val);
+        break;
+    default:
+        break;
+    }
+}
+
+void ps2_gs_hwreg_pair(u64 lo, u64 hi) {
+    if (g_cap_shallow) { ps2_cap_reg(GS_HWREG, lo); ps2_cap_reg(GS_HWREG, hi); }
+    gs_stat_regs += 2;
+    gs_reg_hist[GS_HWREG] += 2;
+    gs_reg[GS_HWREG] = hi;
+    PS2_PHASE_BEGIN(PS2_PH_TRX);
+    trx_data_inner(lo);
+    trx_data_inner(hi);
+    PS2_PHASE_END(PS2_PH_TRX);
+}
+
+/* debugging: PS2_TRX_SAVE=<dbp bytes>:<prefix> saves the IMAGE data of each
+   different upload to that address as <prefix>_<hash>.bin (to find a texture's
+   bytes on the disc) */
+static void trx_save(const u8 *src, u32 qwc) {
+    static int parsed;
+    static u32 want;
+    static char prefix[600];
+    static u32 seen[256];
+    static unsigned nseen;
+    u32 h = 2166136261u;
+    if (!parsed) {
+        const char *e = getenv("PS2_TRX_SAVE");
+        char *end;
+        parsed = 1;
+        if (e) {
+            want = (u32)strtoul(e, &end, 0);
+            if (*end == ':') snprintf(prefix, sizeof prefix, "%s", end + 1);
+        }
+    }
+    if (!prefix[0] || trx_dbp != want) return;
+    {   /* an upload may come in several pieces: gather the whole of it */
+        static u8 *acc;
+        static u32 have, need;
+        u64 rg = gs_reg[GS_TRXREG];
+        if (!have) {
+            need = (u32)(((rg & 0xFFFull) * ((rg >> 32) & 0xFFFull) * trx_g.bits + 7u) / 8u);
+            free(acc);
+            acc = (u8 *)malloc(need + 16u * qwc + 16u);
+            if (!acc) return;
+        }
+        if (have + qwc * 16u > need + 16u * qwc + 16u) { have = 0; return; }
+        memcpy(acc + have, src, qwc * 16u);
+        have += qwc * 16u;
+        if (have < need) return;
+        for (u32 i = 0; i < need; i++) h = (h ^ acc[i]) * 16777619u;
+        have = 0;
+        for (unsigned k = 0; k < nseen; k++) if (seen[k] == h) return;
+        if (nseen < 256u) seen[nseen++] = h;
+        {   char path[700];
+            FILE *f;
+            snprintf(path, sizeof path, "%s_%08x.bin", prefix, h);
+            if ((f = fopen(path, "wb"))) { fwrite(acc, 1, need, f); fclose(f); }
+            ps2_log("trx-save: %u bytes for dbp %u -> %s", need, want, path);
+        }
+    }
+}
+
+const u8 *ps2_glyphs_upload(u32 dbp, u32 psm, u32 w, u32 h, u32 x, u32 y,
+                            const u8 *src, u32 bytes);
+
+void ps2_gs_hwreg_stream(const void *data, u32 qwc) {
+    const u8 *src = (const u8 *)data;
+    if (qwc == 640u || qwc == 68u) {         /* the block font / menu bar icons? */
+        const u8 *alt;
+        if (gs_reg[GS_BITBLTBUF] != trx_bb_seen || gs_reg[GS_TRXREG] != trx_rg_seen
+            || gs_reg[GS_TRXPOS] != trx_pos_seen)
+            trx_geom_sync();
+        alt = ps2_glyphs_upload(trx_dbp, trx_dpsm, trx_rrw,
+                                (u32)((gs_reg[GS_TRXREG] >> 32) & 0xFFFull),
+                                (u32)((gs_reg[GS_TRXPOS] >> 32) & 0x7FFull),
+                                (u32)((gs_reg[GS_TRXPOS] >> 48) & 0x7FFull), src, qwc * 16u);
+        if (alt) src = alt;
+    }
+    if (PS2_UNLIKELY(PS2_ENV("PS2_TRX_SAVE"))) {
+        if (gs_reg[GS_BITBLTBUF] != trx_bb_seen || gs_reg[GS_TRXREG] != trx_rg_seen
+            || gs_reg[GS_TRXPOS] != trx_pos_seen)
+            trx_geom_sync();
+        trx_save(src, qwc);
+    }
+    gs_stat_regs += (u64)qwc * 2u;
+    gs_reg_hist[GS_HWREG] += (u64)qwc * 2u;
+    PS2_PHASE_BEGIN(PS2_PH_TRX);
+    if (qwc && trx_bulk_on() && trx_bulk(src, qwc)) {
+        memcpy(&gs_reg[GS_HWREG], src + (size_t)(qwc - 1u) * 16u + 8u, 8);
+        PS2_PHASE_END(PS2_PH_TRX);
+        return;
+    }
+    for (u32 i = 0; i < qwc; i++) {
+        u64 words[2];
+        memcpy(words, src + (size_t)i * 16u, sizeof(words));
+        gs_reg[GS_HWREG] = words[1];
+        trx_data_inner(words[0]);
+        trx_data_inner(words[1]);
+    }
+    PS2_PHASE_END(PS2_PH_TRX);
+}
+
+static u64 display_reg(void) {
+    u64 pmode = ps2_gs_priv_read(0x12000000u);
+    if (pmode & 2ull) return ps2_gs_priv_read(0x120000A0u);
+    return ps2_gs_priv_read(0x12000080u);
+}
+
+static u64 dispfb_reg(void) {
+    u64 pmode = ps2_gs_priv_read(0x12000000u);
+    if (pmode & 2ull) return ps2_gs_priv_read(0x12000090u);
+    return ps2_gs_priv_read(0x12000070u);
+}
+
+u32 ps2_gs_display_width(void) {
+    u64 d = display_reg();
+    u32 w = (u32)(((d >> 32) & 0xFFFull) + 1u);
+    u32 magh = (u32)(((d >> 23) & 0xFull) + 1u);
+    return magh ? w / magh : w;
+}
+
+u32 ps2_gs_display_height(void) {
+    u64 d = display_reg();
+    u32 magv = (u32)(((d >> 27) & 3ull) + 1u);
+    u32 h = (u32)(((d >> 44) & 0x7FFull) + 1u);
+    return magv ? h / magv : h;
+}
+
+const u8 *ps2_gs_framebuffer(u32 *w, u32 *h, u32 *stride) {
+    u64 fb = dispfb_reg();
+    u32 base = (u32)(fb & 0x1FFull) * 2048u * 4u;
+    u32 fbw = (u32)((fb >> 9) & 0x3Full) * 64u;
+    u32 dw = ps2_gs_display_width(), dh = ps2_gs_display_height();
+    if (!fbw) fbw = 640;
+    if (!dw || dw > 2048) dw = 640;
+    if (!dh || dh > 2048) dh = 448;
+    *w = dw; *h = dh; *stride = fbw * 4u;
+    if (!gs_vram || base >= GS_VRAM_SIZE) return NULL;
+    return gs_vram + base;
+}
+
+void ps2_gs_reg_hist_report(void) {
+    char line[900] = {0};
+    int n = 0;
+    for (u32 r = 0; r < 0x64; r++) {
+        if (!gs_reg_hist[r]) continue;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %02X:%llu",
+                      r, (unsigned long long)gs_reg_hist[r]);
+        if (n > 800) break;
+    }
+    ps2_log("gs regs:%s", line);
+}
+
+void ps2_gs_trx_stats(u64 *transfers, u64 *pixels) {
+    *transfers = gs_stat_trx;
+    *pixels = gs_stat_trxpix;
+}
+
+void ps2_gs_stats(u64 *prims, u64 *pixels, u64 *regs) {
+    *prims = gs_stat_prims;
+    *pixels = gs_stat_pixels;
+    *regs = gs_stat_regs;
+}
+
+static int gs_test_fail;
+
+static void gs_expect(const char *what, u32 got, u32 want) {
+    if (got != want) {
+        gs_test_fail++;
+        ps2_log("  FAIL %-42s got %08X want %08X", what, got, want);
+    }
+}
+
+int ps2_gs_selftest(void) {
+    static const u8 col_r0[8] = { 0, 1, 4, 5, 8, 9, 12, 13 };
+    static const u8 col_r1[8] = { 2, 3, 6, 7, 10, 11, 14, 15 };
+    u32 cls, x, y, i;
+
+    if (!gs_vram) ps2_gs_init();
+    if (!gs_swz_ready) gs_swz_init();
+    gs_test_fail = 0;
+    ps2_log("---- GS local-memory self-test (GS_Users_Manual.pdf p.162-169) ----");
+
+    for (cls = 0; cls < 4; cls++) {
+        u32 bw = (cls == GS_SW32) ? 8u : (cls == GS_SW4) ? 32u : 16u;
+        u32 colh = (cls == GS_SW8 || cls == GS_SW4) ? 4u : 2u;
+        u32 bits = (cls == GS_SW32) ? 32u : (cls == GS_SW16) ? 16u
+                 : (cls == GS_SW8) ? 8u : 4u;
+        u32 bh0 = (cls == GS_SW32 || cls == GS_SW16) ? 8u : 16u;
+        for (y = 0; y < bh0; y++) {
+            u32 colnum = y / colh, cy = y % colh;
+            for (x = 0; x < bw; x++) {
+                u32 w = (gs_swz[cls][y * bw + x] % 512u) / 32u;
+                u32 want = (cy & 1u) ? col_r1[x & 7u] : col_r0[x & 7u];
+                char nm[64];
+                if (colh == 4u && (((cy >> 1) & 1u) ^ (colnum & 1u))) want ^= 8u;
+                snprintf(nm, sizeof nm, "class %u column word (%u,%u)", cls, x, y);
+                gs_expect(nm, w, want);
+            }
+        }
+        {
+            u32 bh = (cls == GS_SW32 || cls == GS_SW16) ? 8u : 16u;
+            u8 seen[2048 / 4];
+            u32 n = bw * bh, dup = 0, span = 0;
+            memset(seen, 0, sizeof seen);
+            for (i = 0; i < n; i++) {
+                u32 off = gs_swz[cls][i], k;
+                for (k = 0; k < bits / 4u; k++) {
+                    u32 slot = off / 4u + k;
+                    if (slot >= sizeof seen || seen[slot]) dup++;
+                    else seen[slot] = 1;
+                }
+                if (off + bits > span) span = off + bits;
+            }
+            {
+                char nm[64];
+                snprintf(nm, sizeof nm, "class %u block is a bijection", cls);
+                gs_expect(nm, dup, 0);
+                snprintf(nm, sizeof nm, "class %u block spans 2048 bits", cls);
+                gs_expect(nm, span, 2048u);
+            }
+        }
+    }
+
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) {
+            u32 v = 0xAABBCCDDu ^ (x * 0x01010101u) ^ (y * 0x00010001u);
+            vram_put(0, 64, x, y, PSM_CT32, v);
+            gs_expect("T8H  aliases CT32 bits 31-24",
+                      vram_get(0, 64, x, y, PSM_T8H),  (v >> 24) & 0xFFu);
+            gs_expect("T4HH aliases CT32 bits 31-28",
+                      vram_get(0, 64, x, y, PSM_T4HH), (v >> 28) & 0x0Fu);
+            gs_expect("T4HL aliases CT32 bits 27-24",
+                      vram_get(0, 64, x, y, PSM_T4HL), (v >> 24) & 0x0Fu);
+        }
+    }
+
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) {
+            u32 lo = 0x1234u ^ (x * 0x0101u) ^ y, hi = 0xBEEFu ^ (x * 0x0303u);
+            vram_put(0, 64, x,      y, PSM_CT16, lo);
+            vram_put(0, 64, x + 8u, y, PSM_CT16, hi);
+            gs_expect("CT16 low half survives the high write",
+                      vram_get(0, 64, x, y, PSM_CT16), lo);
+            gs_expect("CT16 pair packs into one CT32 slot",
+                      vram_get(0, 64, x, y, PSM_CT32), lo | (hi << 16));
+        }
+    }
+
+    {
+        static const u32 fmts[] = { PSM_CT32, PSM_CT24, PSM_CT16, PSM_CT16S,
+                                    PSM_T8, PSM_T4, PSM_Z32, PSM_Z16,
+                                    PSM_Z16S, PSM_Z24 };
+        for (i = 0; i < sizeof fmts / sizeof fmts[0]; i++) {
+            u32 psm = fmts[i], bits = psm_bits(psm);
+            u32 mask = (bits >= 32u) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+            u32 w = 128, h = 64, bad = 0;
+            if (psm == PSM_CT24 || psm == PSM_Z24) mask = 0x00FFFFFFu;
+            memset(gs_vram, 0, GS_VRAM_SIZE);
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++)
+                    vram_put(0, w, x, y, psm,
+                             (x * 2654435761u + y * 40503u) & mask);
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++)
+                    if (vram_get(0, w, x, y, psm)
+                        != ((x * 2654435761u + y * 40503u) & mask)) bad++;
+            {
+                char nm[64];
+                snprintf(nm, sizeof nm, "psm %u round-trips %ux%u", psm, w, h);
+                gs_expect(nm, bad, 0);
+            }
+        }
+        memset(gs_vram, 0, GS_VRAM_SIZE);
+    }
+
+    {
+        float w, h;
+        const u32 base=0x200000;
+        gs_prim=PRIM_TME;
+        gs_state_ver++;
+        gs_reg[GS_TEX0_1]=(base/256u) | (8ull<<14) | ((u64)PSM_T8<<20)
+                        | (9ull<<26) | (9ull<<30);
+        gs_reg[GS_TEX1_1]=0;
+        trx_ext_note(base,0,0,128,64);
+        memset(texcache,0,sizeof(texcache));
+        memset(texmembers,0,sizeof(texmembers));
+        current_texture(&w,&h);
+        gs_expect("partial atlas S scale",(u32)w,512);
+        gs_expect("partial atlas T scale",(u32)h,512);
+        current_texture(&w,&h);
+        gs_expect("cached atlas T scale",(u32)h,512);
+        trx_ext_note(base,0,0,512,384);
+        gs_mark_dirty(base,base+8192);
+        current_texture(&w,&h);
+        gs_expect("growing atlas T scale",(u32)h,512);
+        gs_reg[GS_TEX1_1]=1ull | (3ull<<2) | (4ull<<6) | (1ull<<9) | (32ull<<32);
+        trx_ext_note(base+327680,0,0,32,16);
+        current_texture(&w,&h);
+        gs_expect("partial mip S scale",(u32)w,128);
+        gs_expect("partial mip T scale",(u32)h,128);
+        memset(texcache,0,sizeof(texcache));
+        memset(texmembers,0,sizeof(texmembers));
+    }
+    ps2_log("gs selftest: %s", gs_test_fail ? "FAILED" : "all checks passed");
+    return gs_test_fail ? 1 : 0;
+}

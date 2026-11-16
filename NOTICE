@@ -1,0 +1,25 @@
+Mobius01 - Ace Combat 04: Shattered Skies PC port
+
+This product includes software from:
+
+  Ace Combat 04 PC Port
+  Copyright PresidentRaptor and contributors
+  https://github.com/PresidentRaptor/Ace-Combat-04-PC-Port
+  Licensed under the Apache License, Version 2.0
+
+  Ace Combat 5 Static Recompilation (recompiler and shared runtime)
+  Copyright sal063 and contributors
+  https://github.com/sal063/Ace-Combat-5-Static-recompilation
+  Licensed under the Apache License, Version 2.0
+
+Third-party libraries keep their own licenses (see third_party/ and
+CREDITS.md): SDL3, Dear ImGui, Lua, the Vulkan headers and loader, and the
+MinGW-w64 / MSYS2 toolchain used to build.
+
+Changes made in Mobius01 (installer, launchers, engine fixes, translation
+tools, mods) are listed in README.md and CHANGELOG.md and are distributed
+under the same Apache License, Version 2.0.
+
+Ace Combat is a trademark of Bandai Namco Entertainment Inc. This project is
+not affiliated with or endorsed by Bandai Namco. No game code or data is
+included; users must supply their own legally obtained copy of the game.

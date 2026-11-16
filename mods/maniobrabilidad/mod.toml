@@ -1,0 +1,7 @@
+name = "Maniobrabilidad mejorada"
+version = "1.0"
+game = "SLUS-20152"
+enabled = false
+
+[config]
+pitch_boost = "1.25"

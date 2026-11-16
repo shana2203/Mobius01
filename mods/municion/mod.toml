@@ -1,0 +1,9 @@
+name = "Municion extra (launcher)"
+game = "SLUS-20152"
+enabled = false
+
+[config]
+gun = 40
+missiles = 71
+special = 226
+credits = 0

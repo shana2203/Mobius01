@@ -1,0 +1,397 @@
+#version 450
+layout(location = 0) in vec4 v_color;
+layout(location = 1) in vec3 v_stq;
+layout(location = 2) in float v_fog;
+layout(location = 3) flat in uint v_round_uv;
+layout(location = 4) flat in uvec2 v_clamp;
+
+layout(location = 0, index = 0) out vec4 out_color;
+layout(location = 0, index = 1) out vec4 out_blend;
+
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 1, binding = 0) uniform sampler2D dsttex;
+layout(set = 3, binding = 0) uniform sampler2D clutrt;   // render target holding a CLUT,
+                                                         // a palette, or the next mip level
+
+layout(push_constant) uniform PC {
+    vec2  inv_size;
+    vec2  tex_size;
+    uvec4 flags;
+    vec4  fogcol;
+    uvec4 clamp_uv;
+    vec2  img_size;
+    float scale;
+    float point_size;
+    float tex_scale;
+    uint  clut_xy;
+    uint  pad;
+    uint  mip;      // per-pixel mip level, see ps2_vk_state.mip
+} pc;
+
+const uint RUV_SPRITE = 1u << 29;
+const uint RUV_CLAMP  = 1u << 30;
+
+float gs_wrap(float t, uint mode, float lo, float hi, float size, bool own) {
+    if (mode == 0u) return own ? mod(t, max(size, 1.0)) : t;
+    if (mode == 1u) return clamp(t, 0.0, max(size - 1.0, 0.0));
+    if (mode == 2u) return clamp(t, lo, max(hi, lo));
+    return float((int(floor(t)) & int(lo)) | int(hi));
+}
+
+float sprite_round(float t, uint mode, int origin, int pixel) {
+    if (mode == 0u) return t + 1.0 / 1024.0;
+    float halftexel = floor(t * 2.0 + 0.5) * 0.5;
+    if (abs(t - halftexel) > 1.0 / 64.0) return t;
+    return halftexel + ((mode == 1u || pixel == origin) ? 1.0 : -1.0) / 64.0;
+}
+
+vec4 sample_region_repeat(vec2 tc) {
+    vec2 lo = floor(tc), hi = lo + 1.0, w = fract(tc);
+    ivec2 a, b, size = textureSize(tex, 0);
+    a.x = int(gs_wrap(lo.x, pc.flags.z & 3u, float(pc.clamp_uv.x), float(pc.clamp_uv.y), pc.tex_size.x, true));
+    b.x = int(gs_wrap(hi.x, pc.flags.z & 3u, float(pc.clamp_uv.x), float(pc.clamp_uv.y), pc.tex_size.x, true));
+    a.y = int(gs_wrap(lo.y, (pc.flags.z >> 2) & 3u, float(pc.clamp_uv.z), float(pc.clamp_uv.w), pc.tex_size.y, true));
+    b.y = int(gs_wrap(hi.y, (pc.flags.z >> 2) & 3u, float(pc.clamp_uv.z), float(pc.clamp_uv.w), pc.tex_size.y, true));
+    a = ((a % size) + size) % size;
+    b = ((b % size) + size) % size;
+    return mix(mix(texelFetch(tex, a, 0), texelFetch(tex, ivec2(b.x, a.y), 0), w.x),
+               mix(texelFetch(tex, ivec2(a.x, b.y), 0), texelFetch(tex, b, 0), w.x), w.y);
+}
+
+// CLUT entry `e` read from the render target the GPU drew it into (CSM1, PSMCT32):
+// 4-bit textures use an 8x2 block per 16 entries, 8-bit ones 16x16 with the
+// GS's bit 3/4 swap.
+vec4 clut_rt_entry(uint e, bool four) {
+    uint cx, cy;
+    if (four) { cx = e & 7u; cy = e >> 3; }
+    else {
+        uint p = (e & ~0x18u) | ((e & 8u) << 1) | ((e & 16u) >> 1);
+        cx = p & 15u; cy = p >> 4;
+    }
+    int s = max(int(pc.scale + 0.5), 1);
+    ivec2 at = ivec2(int(pc.clut_xy & 0xFFFFu) + int(cx), int(pc.clut_xy >> 16) + int(cy));
+    return texelFetch(clutrt, at * s + s / 2, 0);
+}
+vec4 clut_rt_texel(ivec2 p, bool four) {
+    ivec2 size = textureSize(tex, 0);
+    p = ((p % size) + size) % size;
+    return clut_rt_entry(uint(texelFetch(tex, p, 0).r * 255.0 + 0.5), four);
+}
+vec4 clut_rt_bilinear(vec2 tc, bool four) {
+    vec2 lo = floor(tc), hi = lo + 1.0, w = fract(tc);
+    ivec2 a, b;
+    a.x = int(gs_wrap(lo.x, pc.flags.z & 3u, float(pc.clamp_uv.x), float(pc.clamp_uv.y), pc.tex_size.x, true));
+    b.x = int(gs_wrap(hi.x, pc.flags.z & 3u, float(pc.clamp_uv.x), float(pc.clamp_uv.y), pc.tex_size.x, true));
+    a.y = int(gs_wrap(lo.y, (pc.flags.z >> 2) & 3u, float(pc.clamp_uv.z), float(pc.clamp_uv.w), pc.tex_size.y, true));
+    b.y = int(gs_wrap(hi.y, (pc.flags.z >> 2) & 3u, float(pc.clamp_uv.z), float(pc.clamp_uv.w), pc.tex_size.y, true));
+    return mix(mix(clut_rt_texel(a, four), clut_rt_texel(ivec2(b.x, a.y), four), w.x),
+               mix(clut_rt_texel(ivec2(a.x, b.y), four), clut_rt_texel(b, four), w.x), w.y);
+}
+
+vec4 sample_hd(sampler2D image, vec2 tc, vec2 logical_size, uvec4 bounds, int scale,
+               float foot);
+
+// The next mip level (bound as clutrt) at the same s/t, for the GS's blend
+// between levels: wrap and region clamp at that level's size, filtered
+// like the level the draw samples.  foot: GS texels per pixel at this draw's
+// level (for a replacement's own mip chain).
+vec4 sample_next_level(vec2 st, bool point, bool half_texel, float foot) {
+    vec2 size = max(floor(pc.tex_size * 0.5), vec2(1.0));
+    uvec4 cl = pc.clamp_uv >> 1u;
+    uint mu = pc.flags.z & 3u, mv = (pc.flags.z >> 2) & 3u;
+    ivec2 isz = textureSize(clutrt, 0);
+    vec2 tc = st * size;
+    int hd = int((pc.flags.y >> 6) & 15u);
+    if (hd > 0)
+        return sample_hd(clutrt, tc - (half_texel ? 0.5 : 0.0), size, cl, hd, foot * 0.5);
+    if (point) {
+        ivec2 p = ivec2(floor(vec2(
+            gs_wrap(tc.x + 1.0 / 32.0, mu, float(cl.x), float(cl.y), size.x, true),
+            gs_wrap(tc.y + 1.0 / 32.0, mv, float(cl.z), float(cl.w), size.y, true))));
+        return texelFetch(clutrt, ((p % isz) + isz) % isz, 0);
+    }
+    if (half_texel) tc -= 0.5;
+    vec2 lo = floor(tc), hi = lo + 1.0, w = tc - lo;
+    ivec2 a, b;
+    a.x = int(gs_wrap(lo.x, mu, float(cl.x), float(cl.y), size.x, true));
+    b.x = int(gs_wrap(hi.x, mu, float(cl.x), float(cl.y), size.x, true));
+    a.y = int(gs_wrap(lo.y, mv, float(cl.z), float(cl.w), size.y, true));
+    b.y = int(gs_wrap(hi.y, mv, float(cl.z), float(cl.w), size.y, true));
+    a = ((a % isz) + isz) % isz;
+    b = ((b % isz) + isz) % isz;
+    return mix(mix(texelFetch(clutrt, a, 0), texelFetch(clutrt, ivec2(b.x, a.y), 0), w.x),
+               mix(texelFetch(clutrt, ivec2(a.x, b.y), 0), texelFetch(clutrt, b, 0), w.x), w.y);
+}
+
+int wrap_up(int k, uint mode, int lo, int hi, int size, int s) {
+    if (mode == 0u) {
+        int period = max(size, 1) * s;
+        return k - period * int(floor(float(k) / float(period)));
+    }
+    if (mode == 1u) return clamp(k, 0, max(size, 1) * s - 1);
+    if (mode == 2u) return clamp(k, lo * s, max(hi, lo) * s + s - 1);
+    int g = int(floor(float(k) / float(s)));
+    return ((g & lo) | hi) * s + (k - g * s);
+}
+
+// A replacement ("HD") texture, `scale` times the GS texture.  Each bilinear
+// tap is wrapped in GS texel units (wrap_up), so CLAMP, REGION_CLAMP and
+// REGION_REPEAT behave as on the GS while keeping the sub-texel detail; for an
+// atlas window the result is then reduced into the replacement tile.
+vec4 sample_hd_level(sampler2D image, vec2 tc, vec2 logical_size, uvec4 bounds,
+                     int scale, int lv) {
+    vec2 c = (tc + 0.5) * float(scale) - 0.5;
+    ivec2 p = ivec2(floor(c)), size = textureSize(image, lv);
+    vec2 w = fract(c);
+    uint mu = pc.flags.z & 3u, mv = (pc.flags.z >> 2) & 3u;
+    ivec2 a = ivec2(wrap_up(p.x, mu, int(bounds.x), int(bounds.y), int(logical_size.x), scale),
+                    wrap_up(p.y, mv, int(bounds.z), int(bounds.w), int(logical_size.y), scale));
+    ivec2 b = ivec2(wrap_up(p.x+1, mu, int(bounds.x), int(bounds.y), int(logical_size.x), scale),
+                    wrap_up(p.y+1, mv, int(bounds.z), int(bounds.w), int(logical_size.y), scale));
+    a = ((a % size) + size) % size;
+    b = ((b % size) + size) % size;
+    return mix(mix(texelFetch(image, a, lv), texelFetch(image, ivec2(b.x,a.y), lv), w.x),
+               mix(texelFetch(image, ivec2(a.x,b.y), lv), texelFetch(image, b, lv), w.x), w.y);
+}
+
+// The replacement carries a mip chain: minified, it steps down its levels
+// (blending between two) as far as the GS texture's own resolution, so the
+// extra detail fades out with distance instead of shimmering, and a distant
+// surface looks as it did on the PS2.  foot: GS texels per pixel.
+vec4 sample_hd(sampler2D image, vec2 tc, vec2 logical_size, uvec4 bounds, int scale,
+               float foot) {
+    int top = 0;
+    for (int k = scale; k > 1 && (k & 1) == 0; k >>= 1) top++;
+    top = min(top, textureQueryLevels(image) - 1);
+    float lod = clamp(log2(max(foot * float(scale), 1e-6)), 0.0, float(top));
+    int l0 = int(lod);
+    vec4 t = sample_hd_level(image, tc, logical_size, bounds, scale >> l0, l0);
+    if (l0 < top && lod > float(l0))
+        t = mix(t, sample_hd_level(image, tc, logical_size, bounds, scale >> (l0 + 1), l0 + 1),
+                lod - float(l0));
+    return t;
+}
+
+vec4 sample_region_repeat_up(vec2 tc) {
+    int s = int(pc.tex_scale + 0.5);
+    vec2 c = (tc + 0.5) * pc.tex_scale - 0.5;
+    vec2 lo = floor(c), w = c - lo;
+    ivec2 size = textureSize(tex, 0);
+    uint mu = pc.flags.z & 3u, mv = (pc.flags.z >> 2) & 3u;
+    int tw = int(pc.tex_size.x), th = int(pc.tex_size.y);
+    int x0 = int(lo.x), y0 = int(lo.y);
+    ivec2 a = ivec2(wrap_up(x0, mu, int(pc.clamp_uv.x), int(pc.clamp_uv.y), tw, s),
+                    wrap_up(y0, mv, int(pc.clamp_uv.z), int(pc.clamp_uv.w), th, s));
+    ivec2 b = ivec2(wrap_up(x0 + 1, mu, int(pc.clamp_uv.x), int(pc.clamp_uv.y), tw, s),
+                    wrap_up(y0 + 1, mv, int(pc.clamp_uv.z), int(pc.clamp_uv.w), th, s));
+    a -= size * ivec2(floor(vec2(a) / vec2(size)));
+    b -= size * ivec2(floor(vec2(b) / vec2(size)));
+    return mix(mix(texelFetch(tex, a, 0), texelFetch(tex, ivec2(b.x, a.y), 0), w.x),
+               mix(texelFetch(tex, ivec2(a.x, b.y), 0), texelFetch(tex, b, 0), w.x), w.y);
+}
+
+// How far an anisotropic footprint may reach along a clamped axis: up to the
+// edge of the clamp range, so the extra taps never wrap round to the far side
+// of the texture or into the next region.
+float aniso_reach(float t, uint mode, float lo, float hi, float size) {
+    if (mode == 1u) { lo = 0.0; hi = max(size - 1.0, 0.0); }
+    else if (mode != 2u) return 1e30;
+    return 2.0 * (min(t - lo, max(hi, lo) - t) + 0.5);
+}
+
+void main() {
+    out_blend = vec4(1.0);
+    /* GS texels per pixel, taken here before anything can discard: a
+       discarded neighbour leaves later derivatives undefined, which plain
+       bilinear filtering never reads but anisotropic filtering does */
+    vec2 gdx, gdy;
+    {
+        vec2 tcd = ((pc.flags.x >> 2) & 1u) != 0u
+                 ? v_stq.xy : (v_stq.xy / max(v_stq.z, 1e-9)) * pc.tex_size;
+        gdx = dFdx(tcd);
+        gdy = dFdy(tcd);
+    }
+    vec2 tdx = vec2(0.0), tdy = vec2(0.0);
+    /* upscaled sprites, and the mip level of a replacement texture
+       (flags.y bits 2-9) */
+    if ((pc.scale > 1.0 || ((pc.flags.y >> 2) & 255u) != 0u) && pc.flags.y != 0u) {
+        tdx = gdx;
+        tdy = gdy;
+    }
+    if (pc.flags.w == 1u) { out_color = vec4(1.0, 0.0, 1.0, 1.0); return; }
+    if (pc.flags.w == 2u) { out_color = vec4(v_color.rgb, 1.0); return; }
+    vec4 c = v_color;
+    uint f = pc.flags.x;
+    if ((f & (1u << 24)) != 0u) {
+        vec2 rg = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rg;
+        uint green = uint(round(rg.y * 255.0));
+        uint ta = (f >> ((green & 128u) != 0u ? 27u : 26u)) & 1u;
+        if ((f & (1u << 28)) != 0u && uint(round(rg.x * 255.0)) == 0u && (green & 127u) == 0u)
+            ta = 0u;
+        green = (green & 127u) | (ta << 7);
+        out_color = vec4(rg.x, float(green) / 255.0, rg.x, float(green) / 128.0);
+        out_blend = vec4(1.0);
+        return;
+    }
+    uint tfx  = f & 3u;
+    bool fst  = ((f >> 2) & 1u) != 0u;
+    bool ate  = ((f >> 3) & 1u) != 0u;
+    uint atst = (f >> 4) & 7u;
+    float aref = float((f >> 8) & 0xFFu) / 128.0;
+    bool fge  = ((f >> 16) & 1u) != 0u;
+    bool tcc  = ((f >> 17) & 1u) != 0u;
+    bool afkeep = ((f >> 18) & 1u) != 0u;
+    bool point = ((f >> 19) & 1u) != 0u;
+    int hd = int((pc.flags.y >> 2) & 15u);
+    if (hd > 0) point = false;
+    bool point_rows = point && ((f >> 29) & 1u) != 0u;
+    bool afonly = ((f >> 20) & 1u) != 0u;
+    bool fba   = ((f >> 21) & 1u) != 0u;
+    bool date  = ((f >> 22) & 1u) != 0u;
+    bool datm  = ((f >> 23) & 1u) != 0u;
+    if (date) {
+        float ad = texelFetch(dsttex, ivec2(gl_FragCoord.xy), 0).a;
+        if ((ad >= 1.0) != datm) discard;
+    }
+    /* TEX1.LCM=0: the GS picks the level per pixel, LOD = (log2(1/|Q|) << L) + K.
+       The triangle is drawn once per level its LOD range touches; this draw
+       keeps the pixels of its own level (nearest), or of [level, level + 1)
+       and blends towards the next one (MMIN 3/5).  The two ends are open. */
+    float mip_w = 0.0;
+    if ((pc.mip & (1u << 20)) != 0u) {
+        float lod = -log2(max(abs(v_stq.z), 1e-30)) * float(1u << ((pc.mip >> 12) & 3u))
+                  + float(int(pc.mip << 20) >> 20) / 16.0;
+        float n = float((pc.mip >> 14) & 7u);
+        bool nearest = (pc.mip & (1u << 22)) != 0u;
+        float lo = nearest ? n - 0.5 : n;
+        float last = float((pc.mip >> 17) & 7u) - (nearest ? 0.0 : 1.0);
+        if ((n > 0.0 && lod < lo) || (n < last && lod >= lo + 1.0)) discard;
+        if ((pc.mip & (1u << 21)) != 0u) mip_w = clamp(lod - n, 0.0, 1.0);
+    }
+
+    if (pc.flags.y != 0u) {
+        vec2 tc;
+        if (fst) tc = v_stq.xy;
+        else     tc = (v_stq.xy / max(v_stq.z, 1e-9)) * pc.tex_size;
+        uint ruv = v_round_uv & (RUV_SPRITE - 1u);
+        bool sprite = (v_round_uv & RUV_SPRITE) != 0u;
+        bool rt_up = pc.tex_scale > 1.0;
+        ivec2 pix = ivec2(gl_FragCoord.xy);
+        vec2 sub = vec2(0.0);
+        if (pc.scale > 1.0) {
+            vec2 nat = floor(gl_FragCoord.xy / pc.scale);
+            sub = gl_FragCoord.xy - 0.5 - nat * pc.scale;
+            pix = ivec2(nat);
+            if (point && (sprite || rt_up))
+                tc += (point_rows ? vec2(0.0) : tdx * ((nat.x + 0.5) * pc.scale - gl_FragCoord.x))
+                    + tdy * ((nat.y + 0.5) * pc.scale - gl_FragCoord.y);
+        }
+        if (point && ruv != 0u) {
+            if (!point_rows)
+                tc.x = sprite_round(tc.x, ruv & 3u,
+                    int((ruv >> 4) & 4095u) - 2048, pix.x);
+            tc.y = sprite_round(tc.y, (ruv >> 2) & 3u,
+                int((ruv >> 16) & 4095u) - 2048, pix.y);
+        }
+        if (!point && pc.scale > 1.0 && (v_round_uv & RUV_CLAMP) != 0u) {
+            /* keep upscaled sub-pixels inside the texels the sprite samples
+               at native resolution, so its edges do not bleed */
+            vec2 lo = vec2(float(int(v_clamp.x << 16) >> 16),
+                           float(int(v_clamp.y << 16) >> 16)) / 16.0;
+            vec2 hi = vec2(float(int(v_clamp.x) >> 16),
+                           float(int(v_clamp.y) >> 16)) / 16.0;
+            tc = clamp(tc, lo, hi);
+        }
+        if (!point && (f & (1u << 25)) != 0u) tc -= 0.5;
+        vec2 unwrapped_tc = tc;
+        bool own = any(notEqual(pc.img_size, pc.tex_size));
+        tc.x = gs_wrap(tc.x, pc.flags.z & 3u,
+                       float(pc.clamp_uv.x), float(pc.clamp_uv.y),
+                       pc.tex_size.x, own);
+        tc.y = gs_wrap(tc.y, (pc.flags.z >> 2) & 3u,
+                       float(pc.clamp_uv.z), float(pc.clamp_uv.w),
+                       pc.tex_size.y, own);
+        vec4 t;
+        float foot = max(length(tdx), length(tdy));
+        if (hd > 0) {
+            t = sample_hd(tex, unwrapped_tc, pc.tex_size, pc.clamp_uv, hd, foot);
+        } else if ((f & (1u << 30)) != 0u) {
+            bool four = (f & (1u << 31)) != 0u;
+            if (point) t = clut_rt_texel(ivec2(floor(tc + 1.0 / 32.0)), four);
+            else       t = clut_rt_bilinear(unwrapped_tc, four);
+        } else if (point) {
+            ivec2 size = textureSize(tex, 0);
+            ivec2 p = ivec2(floor(tc + (ruv == 0u ? 1.0 / 32.0 : 0.0)));
+            if (rt_up) {
+                int s = int(pc.tex_scale + 0.5);
+                ivec2 k = clamp(ivec2(sub + 0.5), ivec2(0), ivec2(s - 1));
+                if (tdx.x < 0.0) k.x = s - 1 - k.x;
+                if (tdy.y < 0.0) k.y = s - 1 - k.y;
+                p = p * s + k;
+            }
+            p = ((p % size) + size) % size;
+            t = texelFetch(tex, p, 0);
+        } else if ((pc.flags.z & 3u) == 3u || ((pc.flags.z >> 2) & 3u) == 3u
+                   || (own && ((pc.flags.z & 3u) == 0u
+                               || ((pc.flags.z >> 2) & 3u) == 0u))) {
+            if (rt_up) t = sample_region_repeat_up(unwrapped_tc);
+            else       t = sample_region_repeat(unwrapped_tc);
+        } else {
+            vec2 r = vec2(aniso_reach(tc.x, pc.flags.z & 3u, float(pc.clamp_uv.x),
+                                      float(pc.clamp_uv.y), pc.tex_size.x),
+                          aniso_reach(tc.y, (pc.flags.z >> 2) & 3u, float(pc.clamp_uv.z),
+                                      float(pc.clamp_uv.w), pc.tex_size.y));
+            t = textureGrad(tex, (tc + 0.5) / pc.img_size,
+                            clamp(gdx, -r, r) / pc.img_size, clamp(gdy, -r, r) / pc.img_size);
+        }
+        if (mip_w > 0.0) {
+            vec2 st = fst ? v_stq.xy / pc.tex_size : v_stq.xy / max(v_stq.z, 1e-9);
+            t = mix(t, sample_next_level(st, point, (f & (1u << 25)) != 0u, foot), mip_w);
+        }
+        if ((pc.flags.y & 2u) != 0u) {
+            /* PSMT8H read from a render target: the index is the pixel's alpha
+               byte (targets keep alpha as a/128), looked up in the palette
+               texture bound where a GPU-drawn CLUT would be */
+            uint idx = min(uint(t.a * 128.0 + 0.5), 255u);
+            t = texelFetch(clutrt, ivec2(int(idx), 0), 0);
+        }
+        float af = c.a;
+        vec3 rgb;
+        float a;
+        if (tfx == 1u) {
+            rgb = t.rgb;
+            a   = tcc ? t.a : af;
+        } else if (tfx == 0u) {
+            rgb = t.rgb * c.rgb;
+            a   = tcc ? t.a * af : af;
+        } else if (tfx == 2u) {
+            rgb = t.rgb * c.rgb + af * (128.0 / 255.0);
+            a   = tcc ? t.a + af : af;
+        } else {
+            rgb = t.rgb * c.rgb + af * (128.0 / 255.0);
+            a   = tcc ? t.a : af;
+        }
+        c = vec4(rgb, a);
+    } else {
+        c.rgb *= 128.0 / 255.0;
+    }
+
+    if (fge) c.rgb = mix(pc.fogcol.rgb, c.rgb, clamp(v_fog, 0.0, 1.0));
+
+    if (ate) {
+        bool pass;
+        if      (atst == 0u) pass = false;
+        else if (atst == 1u) pass = true;
+        else if (atst == 2u) pass = c.a <  aref;
+        else if (atst == 3u) pass = c.a <= aref;
+        else if (atst == 4u) pass = abs(c.a - aref) < (0.5 / 128.0);
+        else if (atst == 5u) pass = c.a >= aref;
+        else if (atst == 6u) pass = c.a >  aref;
+        else                 pass = abs(c.a - aref) >= (0.5 / 128.0);
+        if (afonly ? pass : (!pass && afkeep)) discard;
+    }
+
+    out_blend = vec4(0.0, 0.0, 0.0, clamp(c.a, 0.0, 1.0));
+    if (fba) c.a = max(c.a, 1.0);
+    out_color = clamp(c, vec4(0.0), vec4(2.0));
+}

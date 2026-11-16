@@ -1,0 +1,9 @@
+name = "Guiado de misiles"
+version = "1.2"
+game = "SLUS-20152"
+enabled = false
+
+[config]
+# multiplicador del giro de guiado de todos los misiles: 1.00 = original, 2.00 = el doble
+turn_multiplier = "1.75"
+standard_lock_range_multiplier = "1.69"

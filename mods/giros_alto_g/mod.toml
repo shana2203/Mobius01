@@ -1,0 +1,21 @@
+name = "Giros alto G (L1 + R1)"
+version = "3.0"
+game = "SLUS-20152"
+enabled = false
+
+# Al estilo de Ace Combat 7: con L1 + R1 el avion cierra mucho mas el giro,
+# morro y trayectoria juntos, y pierde velocidad mientras dura. Entra y sale
+# de forma gradual (sin saltos).
+#   giro: cuanto mas cierra el giro (1.0 = normal, hasta 2.5)
+#   seguimiento: 1.0 = la trayectoria sigue al morro como en el juego normal;
+#                menos = el morro se adelanta y el avion "patina"
+#   entrada / salida: segundos que tarda en llegar al giro completo / en volver
+#   perdida_velocidad: fraccion de velocidad perdida por segundo tirando a fondo
+#   velocidad_minima: nunca baja de esta fraccion de la velocidad de entrada
+[config]
+giro = "1.80"
+seguimiento = "1.0"
+entrada = "0.30"
+salida = "0.40"
+perdida_velocidad = "0.12"
+velocidad_minima = "0.60"

@@ -1,0 +1,290 @@
+cmake_minimum_required(VERSION 3.20)
+project(ac4_pc_port C CXX)
+
+set(CMAKE_C_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(GEN_OPT "-O1")
+set(CMAKE_C_FLAGS_RELEASE "-O2")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+
+# __FILE__ (assert messages) and debug info name sources relative to the source
+# tree: the executable carries no path, and so no user name, of the PC it was
+# built on.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}" SRC_NATIVE)
+  add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}/=" "-ffile-prefix-map=${SRC_NATIVE}\\=")
+endif()
+
+option(PS2_DIAG "compile the entry histogram and the guest-store watch in" OFF)
+
+set(PS2_EXE ac4)
+
+find_package(Threads REQUIRED)
+
+find_package(Vulkan REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL3 REQUIRED sdl3)
+
+set(PS2_GENERATED_DIR "generated" CACHE STRING
+    "recompiler output directory, relative to the source tree")
+set(GEN_DIR "${CMAKE_SOURCE_DIR}/${PS2_GENERATED_DIR}")
+
+file(GLOB GENERATED_SOURCES CONFIGURE_DEPENDS "${GEN_DIR}/ps2_code_*.c")
+list(APPEND GENERATED_SOURCES
+     "${GEN_DIR}/ps2_func_table.c"
+     "${GEN_DIR}/ps2_image.c"
+     "${GEN_DIR}/ps2_symbols.c")
+
+if(NOT GENERATED_SOURCES)
+  message(FATAL_ERROR
+    "No generated sources. Run:\n"
+    "  bash tools/build_ac4.sh path/to/SLUS_201.52")
+endif()
+
+set(RUNTIME_SOURCES
+    runtime/src/ps2_core.c
+    runtime/src/ps2_hostprof.c
+    runtime/src/ps2_hw.c
+    runtime/src/ps2_gfxq.c
+    runtime/src/ps2_gs.c
+    runtime/src/ps2_vu.c
+    runtime/src/ps2_ipu.c
+    runtime/src/ps2_kernel.c
+    runtime/src/ps2_vsync.c
+    runtime/src/ps2_spu2.c
+    runtime/src/ps2_memcard.c
+    runtime/src/ps2_audio.c
+    runtime/src/ps2_sif.c
+    runtime/src/ps2_vfs.c
+    runtime/src/ps2_hle_test.c
+    runtime/src/ps2_hle_sif.c
+    runtime/src/ps2_hle_cdvd.c
+    runtime/src/ps2_hle_pad.c
+    runtime/src/ps2_hle_iop.c
+    runtime/src/ps2_hle_ac4.c
+    runtime/src/ps2_video.c
+    runtime/src/ps2_texpack.c
+    runtime/src/ps2_state.c
+    runtime/src/ps2_capture.c
+    runtime/src/ps2_statecap.c
+    runtime/src/ps2_settings.c
+    runtime/src/ps2_inflate.c
+    runtime/src/ps2_mod.c
+    runtime/src/ps2_hook.c
+    runtime/src/ps2_modapi.c
+    runtime/src/ps2_patch.c
+    runtime/src/ps2_lua.c
+    runtime/src/ps2_ui.cpp
+    runtime/src/ps2_rec.cpp
+    runtime/src/ps2_glyphs.c
+    runtime/src/rn/rn_dump.c
+    runtime/src/ps2_main.c)
+
+set(LUA_DIR "${CMAKE_SOURCE_DIR}/third_party/lua")
+file(GLOB LUA_SOURCES CONFIGURE_DEPENDS "${LUA_DIR}/*.c")
+add_library(lua54 STATIC ${LUA_SOURCES})
+target_include_directories(lua54 PUBLIC "${LUA_DIR}")
+set_source_files_properties(${LUA_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+target_compile_options(lua54 PRIVATE -O2)
+
+set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+list(APPEND RUNTIME_SOURCES ${IMGUI_SOURCES})
+
+add_executable(${PS2_EXE} ${RUNTIME_SOURCES} ${GENERATED_SOURCES})
+target_include_directories(${PS2_EXE} PRIVATE runtime/include "${GEN_DIR}"
+                                       ${IMGUI_DIR} ${IMGUI_DIR}/backends
+                                       ${SDL3_INCLUDE_DIRS} ${Vulkan_INCLUDE_DIRS})
+target_link_directories(${PS2_EXE} PRIVATE ${SDL3_LIBRARY_DIRS})
+target_link_libraries(${PS2_EXE} PRIVATE Threads::Threads m
+                                  ${SDL3_LIBRARIES} Vulkan::Vulkan lua54)
+target_link_options(${PS2_EXE} PRIVATE -static-libstdc++ -static-libgcc)
+
+option(PS2_HOOK_ENTRIES "patchable entry sleds in generated code, for mod hooks" ON)
+set(GEN_COMPILE_OPTIONS "${GEN_OPT}")
+if(PS2_HOOK_ENTRIES)
+  list(APPEND GEN_COMPILE_OPTIONS "-fpatchable-function-entry=8")
+endif()
+set_source_files_properties(${GENERATED_SOURCES} PROPERTIES
+                            COMPILE_OPTIONS "${GEN_COMPILE_OPTIONS}")
+
+set(HOT_SOURCES runtime/src/ps2_vu.c runtime/src/ps2_gs.c runtime/src/ps2_hw.c
+                runtime/src/ps2_rec.cpp)
+set_source_files_properties(${HOT_SOURCES} PROPERTIES COMPILE_OPTIONS "-O3")
+
+# Opt-in PGO for the shared runtime only. Generated guest code keeps its
+# musttail/patchable-entry contract and the third-party sources are untouched.
+set(PS2_PGO_MODE "off" CACHE STRING "Runtime PGO: off, generate, or use")
+set_property(CACHE PS2_PGO_MODE PROPERTY STRINGS off generate use)
+set(PS2_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Runtime profile directory")
+set(PS2_PGO_EXCLUDE_SOURCES "runtime/src/ps2_hle_pad.c;runtime/src/ps2_modapi.c" CACHE STRING
+    "Runtime files changed since training; compile these without stale PGO")
+# Queue-depth changes invalidate the renderer's old control-flow profile.
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_video.c)
+# The display-locked field clock changed these after the last training run.
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_kernel.c runtime/src/ps2_vsync.c
+                                    runtime/src/ps2_settings.c runtime/src/ps2_ui.cpp
+                                    runtime/src/ps2_inflate.c)
+# ps2_vu.c now includes the recompiled VU1 microprograms (generated/ps2_vu1_progs.inc).
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_vu.c runtime/src/ps2_capture.c)
+# --precompile (pipeline optimisation before play) changed the entry point.
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_main.c)
+# VAG radio-stream prefetch fix (the Mission 01 AWACS freeze).
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_hle_ac4.c)
+# Renderer-thread sampling (PS2_PROFILE_HOST=render).
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_hostprof.c)
+# VIF0 runs on the EE thread (VU0 skinning race fix).
+list(APPEND PS2_PGO_EXCLUDE_SOURCES runtime/src/ps2_gfxq.c)
+# A profile trained on the current source covers every file: nothing to exclude.
+# (pgo-profile/FRESH marks such a profile; Jugar.exe turns this on for it.)
+option(PS2_PGO_FRESH "the PGO profile was trained on this source" OFF)
+if(PS2_PGO_FRESH)
+  set(PS2_PGO_EXCLUDE_SOURCES "")
+endif()
+if(NOT PS2_PGO_MODE MATCHES "^(off|generate|use)$")
+  message(FATAL_ERROR "PS2_PGO_MODE must be off, generate, or use")
+endif()
+if(NOT PS2_PGO_MODE STREQUAL "off")
+  if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "This PGO configuration requires GCC")
+  endif()
+  # Profile files are named after the object path relative to the build
+  # folder, not its absolute path, so a profile trained on one PC is found on
+  # every other (and carries no local paths).  GCC compares the prefix with
+  # the native spelling of the folder ninja compiles in.
+  file(TO_NATIVE_PATH "${CMAKE_BINARY_DIR}" PGO_PREFIX)
+  if(PS2_PGO_MODE STREQUAL "generate")
+    file(MAKE_DIRECTORY "${PS2_PGO_DIR}")
+    set(PGO_FLAGS "-fprofile-generate=${PS2_PGO_DIR}" "-fprofile-prefix-path=${PGO_PREFIX}" -fprofile-update=atomic)
+    # Both executables use shared runtime objects, but each has its own profile.
+    target_link_options(${PS2_EXE} PRIVATE "-fprofile-generate=${PS2_PGO_DIR}")
+  else()
+    file(GLOB_RECURSE PGO_DATA "${PS2_PGO_DIR}/*.gcda")
+    if(NOT PGO_DATA)
+      message(FATAL_ERROR "No PGO data found; build generate mode and train first")
+    endif()
+    # A function edited since training simply loses its profile (GCC drops a
+    # mismatching one); never fail the build over it -- Jugar.exe rebuilds
+    # whenever the source changes, before anyone retrains.
+    set(PGO_FLAGS "-fprofile-use=${PS2_PGO_DIR}" "-fprofile-prefix-path=${PGO_PREFIX}"
+                  -Wno-missing-profile -Wno-coverage-mismatch)
+  endif()
+  foreach(SOURCE IN LISTS RUNTIME_SOURCES)
+    if(SOURCE MATCHES "^runtime/" AND
+       (NOT PS2_PGO_MODE STREQUAL "use" OR NOT SOURCE IN_LIST PS2_PGO_EXCLUDE_SOURCES))
+      set_property(SOURCE "${SOURCE}" APPEND PROPERTY COMPILE_OPTIONS ${PGO_FLAGS})
+    endif()
+  endforeach()
+endif()
+
+if(PS2_DIAG)
+  target_compile_definitions(${PS2_EXE} PRIVATE PS2_DIAG=1)
+endif()
+if(WIN32)
+  # IDXGIOutput::WaitForVBlank for the display-locked field clock
+  target_link_libraries(${PS2_EXE} PRIVATE dxgi ole32)
+  enable_language(RC)
+  configure_file(runtime/ac4.rc.in "${CMAKE_CURRENT_BINARY_DIR}/ac4.rc" @ONLY)
+  target_sources(${PS2_EXE} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ac4.rc")
+endif()
+
+# Per-PC build (Jugar.exe compiles on each new machine): use every instruction
+# set the CPU offers.  Floating-point contraction stays off so FMA cannot change
+# PS2 arithmetic (VU/FPU results must match the interpreter bit for bit).
+option(PS2_NATIVE_CPU "optimise for the CPU of the machine that builds" OFF)
+if(PS2_NATIVE_CPU)
+  target_compile_options(${PS2_EXE} PRIVATE -march=native -mtune=native)
+  target_compile_options(lua54 PRIVATE -march=native -mtune=native)
+endif()
+target_compile_options(${PS2_EXE} PRIVATE -ffp-contract=off)
+
+target_compile_options(${PS2_EXE} PRIVATE
+    -fno-strict-aliasing
+    -fwrapv
+    -Wall -Wextra
+    -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti>)
+
+set(REPLAY_SOURCES ${RUNTIME_SOURCES})
+list(REMOVE_ITEM REPLAY_SOURCES runtime/src/ps2_main.c
+                                runtime/src/ps2_lua.c
+                                runtime/src/ps2_modapi.c
+                                runtime/src/ps2_mod.c
+                                runtime/src/ps2_hook.c
+                                runtime/src/ps2_patch.c)
+list(APPEND REPLAY_SOURCES runtime/src/ps2_replay.c)
+
+add_executable(gsreplay ${REPLAY_SOURCES})
+if(PS2_PGO_MODE STREQUAL "generate")
+  target_link_options(gsreplay PRIVATE "-fprofile-generate=${PS2_PGO_DIR}")
+endif()
+target_include_directories(gsreplay PRIVATE runtime/include "${GEN_DIR}"
+                                            "${LUA_DIR}"
+                                            ${IMGUI_DIR} ${IMGUI_DIR}/backends
+                                            ${SDL3_INCLUDE_DIRS}
+                                            ${Vulkan_INCLUDE_DIRS})
+target_link_directories(gsreplay PRIVATE ${SDL3_LIBRARY_DIRS})
+target_link_libraries(gsreplay PRIVATE Threads::Threads m
+                                       ${SDL3_LIBRARIES} Vulkan::Vulkan)
+if(WIN32)
+  target_link_libraries(gsreplay PRIVATE dxgi ole32)
+endif()
+target_link_options(gsreplay PRIVATE -static-libstdc++ -static-libgcc)
+if(PS2_DIAG)
+  target_compile_definitions(gsreplay PRIVATE PS2_DIAG=1)
+endif()
+
+target_compile_options(gsreplay PRIVATE
+    -fno-strict-aliasing -fwrapv
+    -Wall -Wextra
+    -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti>)
+
+find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin")
+if(NOT GLSLC)
+  message(FATAL_ERROR "glslc not found; it ships with the Vulkan SDK")
+endif()
+
+set(SHADER_OUT "${CMAKE_BINARY_DIR}/shaders")
+file(MAKE_DIRECTORY "${SHADER_OUT}")
+set(SPV_FILES)
+foreach(SH gs.vert gs.frag gs_zcopy.frag colclip.frag present.vert present.frag post.frag)
+  add_custom_command(
+    OUTPUT "${SHADER_OUT}/${SH}.spv"
+    COMMAND "${GLSLC}" -O "${CMAKE_SOURCE_DIR}/runtime/shaders/${SH}"
+            -o "${SHADER_OUT}/${SH}.spv"
+    DEPENDS "${CMAKE_SOURCE_DIR}/runtime/shaders/${SH}"
+    COMMENT "glslc ${SH}")
+  list(APPEND SPV_FILES "${SHADER_OUT}/${SH}.spv")
+endforeach()
+add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
+add_dependencies(${PS2_EXE} shaders)
+add_dependencies(gsreplay shaders)
+
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-std=c23")
+check_c_source_compiles("
+void g(void){}
+void f(void){ [[gnu::musttail]] return g(); }
+int main(void){ f(); return 0; }" HAVE_MUSTTAIL)
+if(NOT HAVE_MUSTTAIL)
+  message(WARNING
+    "This compiler has no musttail attribute. Cross-function guest loops will "
+    "consume stack. GCC 15+ or Clang 13+ is required for a correct build.")
+endif()
+
+
