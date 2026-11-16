@@ -64,9 +64,13 @@ del disco) de **Ace Combat 04 de EE. UU. (SLUS-20152)**.
    - el código del juego, desde tu `SLUS_201.52` (`tools/ps2recomp`, y
      `tools/ac4_vu1.py` + `tools/vurecomp` para los microprogramas VU1), que
      luego se compila para tu procesador;
-   - el mod de español: nuestra traducción aplicada a los textos de tu disco,
-     el HUD y las tarjetas redibujados con sus propias letras
-     (`tools/ac4_mods_from_disc.py`);
+   - si juegas en español, el mod de español: nuestra traducción aplicada a
+     los textos de tu disco, el HUD y las tarjetas redibujados con sus propias
+     letras (`tools/ac4_mods_from_disc.py`). Si instalas en inglés no se genera;
+     al elegir español en Configurar AC4 se genera al jugar, sin recompilar;
+   - el texto en español del final del video de introducción: el video se
+     reproduce oculto una vez y las líneas nuevas se arman con las letras de
+     uno de sus cuadros (`tools/ac4_intro_text.py`);
    - el parche del menú de `mision_libre`;
    - las texturas HD de los menús: el juego arranca oculto hasta el título,
      guarda las texturas que dibuja y nuestro filtro las amplía x4

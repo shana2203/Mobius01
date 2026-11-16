@@ -5,7 +5,7 @@ runs this before the first compile (and again if one of them is missing).
     python ac4_mods_from_disc.py <us.iso> <SLUS_201.52> <mods dir> [on|off]
 
   espanol/       the Spanish mod: our translation only (ac4_espanol_mod.py);
-                 on|off is its state (the language chosen in the setup)
+                 made only with "on" (the player plays in Spanish)
   mision_libre/  files/BIN/DATA.CDP.0272.PARTS, the free-mission hangar menu
                  (ac4_free_mission.py); the mod keeps its own on/off
 Each part is made only when missing; one failing does not stop the others.
@@ -20,7 +20,8 @@ sys.path.insert(0, HERE)
 def main(iso, elf, mods, state="off"):
     failed = 0
     es = os.path.join(mods, "espanol")
-    if not os.path.isdir(os.path.join(es, "files", "BIN")):
+    # English: the game is played in its original language, no Spanish mod
+    if state == "on" and not os.path.isdir(os.path.join(es, "files", "BIN")):
         try:
             import ac4_espanol_mod
             ac4_espanol_mod.main(iso, elf, es, state)

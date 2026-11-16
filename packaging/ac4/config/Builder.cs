@@ -122,8 +122,27 @@ static class Builder
             catch { return null; }
         }
     }
+    // the language chosen in the setup or in Configurar AC4: the Spanish mod
+    // is only made for a player who plays in Spanish
+    public static bool WantsSpanish
+    {
+        get
+        {
+            try { return File.ReadAllText(Path.Combine(Game, "launcher-language.txt")).Trim().StartsWith("es", StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }
+    }
+    // this install can make the Spanish mod from the player's disc
+    public static bool CanMakeSpanish
+    {
+        get
+        {
+            return File.Exists(Path.Combine(Src, "tools", "ac4_mods_from_disc.py")) && File.Exists(ElfPath) && IsoFile != null
+                && Directory.Exists(Path.Combine(Src, "localization", "es-419-propio", "es"));
+        }
+    }
     // mod files made from the game's data (tools/ac4_mods_from_disc.py): the
-    // Spanish mod and mision_libre's hangar menu patch
+    // Spanish mod (only when playing in Spanish) and mision_libre's menu patch
     public static bool NeedsSpanishMod
     {
         get
@@ -131,7 +150,7 @@ static class Builder
             if (!File.Exists(Path.Combine(Src, "tools", "ac4_mods_from_disc.py")) || !File.Exists(ElfPath) || IsoFile == null)
                 return false;
             string mods = Path.GetDirectoryName(SpanishModDir);
-            return (Directory.Exists(Path.Combine(Src, "localization", "es-419-propio", "es"))
+            return (WantsSpanish && CanMakeSpanish
                     && !Directory.Exists(Path.Combine(SpanishModDir, "files", "BIN")))
                 || (File.Exists(Path.Combine(mods, "mision_libre", "mod.toml"))
                     && !File.Exists(Path.Combine(mods, @"mision_libre\files\BIN\DATA.CDP.0272.PARTS")));
@@ -150,6 +169,21 @@ static class Builder
                 && File.Exists(ElfPath) && !Directory.Exists(Path.Combine(Runtime, "textures", "hd"));
         }
     }
+    // the Spanish text over the end of the intro movie (tools/ac4_intro_text.py)
+    public static bool NeedsIntroText
+    {
+        get
+        {
+            // (the Spanish mod itself may be made earlier in the same build:
+            // IntroText checks it is there when it runs)
+            // tried once: a picture that could not be read is not retried on
+            // every start (delete movies\intento-fallido.txt to try again)
+            return WantsSpanish && File.Exists(Path.Combine(Src, "tools", "ac4_intro_text.py")) && IsoFile != null && File.Exists(ElfPath)
+                && !File.Exists(Path.Combine(SpanishModDir, "movies", "INTRO.txt"))
+                && !File.Exists(IntroFailedMark);
+        }
+    }
+    public static string IntroFailedMark { get { return Path.Combine(SpanishModDir, "movies", "intento-fallido.txt"); } }
     public static string GeneratedStamp { get { return Path.Combine(Src, "generated", "generated.stamp"); } }
 
     // true when generated\ must be (re)made from the player's executable
@@ -159,8 +193,11 @@ static class Builder
         {
             if (!CanGenerate) return false;
             if (!File.Exists(Path.Combine(Src, "generated", "ps2_funcs.h"))) return true;
+            // code that came with the package (no stamp) is used as it is;
+            // only code generated here is remade when the recompiler changes
+            if (!File.Exists(GeneratedStamp)) return false;
             try { return File.ReadAllText(GeneratedStamp).Trim() != GeneratorHash(); }
-            catch { return true; }
+            catch { return false; }
         }
     }
     public static string StampPath { get { return Path.Combine(Runtime, "ac4_build.stamp"); } }
@@ -329,9 +366,27 @@ static class Builder
     public static string RebuildReason()
     {
         if (!SourceAvailable) return null;
+        return CodeRebuildReason() ?? DataReason();
+    }
+
+    // files made from the player's disc that are missing while ac4.exe is up
+    // to date (e.g. the player switched to Spanish): made without recompiling
+    public static string DataReason()
+    {
+        if (NeedsSpanishMod) return "Faltan datos de los mods (español, misión libre): se generan desde tu disco, sin recompilar.";
+        if (NeedsIntroText) return "Falta el texto en español del video de introducción: se prepara desde tu disco.";
+        return null;
+    }
+
+    // a full build was asked for (Compilar / --compilar)
+    public static bool ForceFull;
+
+    // why ac4.exe itself must be (re)built; null when it is up to date
+    public static string CodeRebuildReason()
+    {
+        if (!SourceAvailable) return null;
         if (!File.Exists(GameExe)) return "Primera ejecución: se genera el código del juego desde tu disco y se compila para tu PC.";
         if (NeedsGenerate) return "Cambió el recompilador del port: se vuelve a generar el código del juego.";
-        if (NeedsSpanishMod) return "Faltan datos de los mods (español, misión libre): se generan desde tu disco.";
         // AC4Recomp-desarrollo\COMPILACION_MANUAL.txt: the developer installs each
         // build by hand (COMPILAR.bat), so a source edit must not recompile on
         // play -- but new hardware or a new graphics driver still does
@@ -357,6 +412,7 @@ static class Builder
         if (!SourceAvailable) return true;               // prebuilt package: nothing to compile
         string reason = force ? "Compilación solicitada." : RebuildReason();
         if (reason == null) return true;
+        if (force) ForceFull = true;
 
         if (allowElevation && !IsElevated && Environment.GetEnvironmentVariable("AC4_NO_ELEVATE") != "1")
         {
@@ -468,6 +524,18 @@ class BuildJob
             }
             if (Builder.MissingPackages().Count > 0)
                 steps.Add(new Step { Name = "Instalando dependencias", Weight = 18, Run = InstallPackages });
+            // ac4.exe up to date and only files from the disc missing: just those
+            bool full = Builder.ForceFull || Builder.CodeRebuildReason() != null;
+            if (!full)
+            {
+                Log("ac4.exe is up to date: only the missing files are made");
+                if (Builder.NeedsSpanishMod)
+                    steps.Add(new Step { Name = "Generando los datos de los mods desde tu disco", Weight = 6, Run = ModsFromDisc });
+                if (Builder.NeedsIntroText)
+                    steps.Add(new Step { Name = "Preparando el texto en español del video de introducción", Weight = 8, Run = IntroText });
+            }
+            else
+            {
             if (Builder.NeedsGenerate)
                 steps.Add(new Step { Name = "Generando el código del juego desde tu disco", Weight = 3, Run = Generate });
             if (Builder.NeedsSpanishMod)
@@ -479,6 +547,9 @@ class BuildJob
             steps.Add(new Step { Name = "Optimizando shaders para tu GPU", Weight = 4, Run = Precompile });
             if (Builder.NeedsHdMenus)
                 steps.Add(new Step { Name = "Preparando las texturas HD de los menús", Weight = 4, Run = HdMenus });
+            if (Builder.NeedsIntroText)
+                steps.Add(new Step { Name = "Preparando el texto en español del video de introducción", Weight = 8, Run = IntroText });
+            }
 
             double total = steps.Sum(s => s.Weight), done = 0;
             foreach (var st in steps)
@@ -491,7 +562,7 @@ class BuildJob
                 st.Run(f => Report(baseFrac + w * Math.Max(0, Math.Min(1, f)), name, null));
                 done += st.Weight;
             }
-            Builder.WriteStamp();
+            if (full) Builder.WriteStamp();
             Log("build finished");
             Report(1, "Listo", "");
         }
@@ -1010,6 +1081,73 @@ class BuildJob
         catch (OperationCanceledException) { throw; }
         catch (Exception e) { Log("HD menu textures not made: " + e.Message); }
         finally { try { Directory.Delete(tmp, true); } catch { } }
+        p(1);
+    }
+
+    // the intro movie played once, hidden and silent: a new game on throwaway
+    // saves (the first story movie, SS01, is served as SMV/INTRO.SMV) with no
+    // mods, so its pictures are the disc's own; tools/ac4_intro_text.py lays
+    // the Spanish lines out from one of them into mods\espanol\movies.
+    // Never stops the game: without it the intro ends in English.
+    void IntroText(Action<double> p)
+    {
+        if (!File.Exists(Path.Combine(Builder.SpanishModDir, "mod.toml"))) { Log("no Spanish mod: no intro text"); p(1); return; }
+        // a busy PC reaches the title and the movie later: a second, longer
+        // run with the buttons pressed later if the first saw no usable picture
+        var tries = new[] { new[] { 1100, 11500 }, new[] { 1800, 17000 } };
+        bool made = false;
+        for (int t = 0; t < tries.Length && !made; t++)
+        {
+            int at = tries[t][0], vblanks = tries[t][1];
+            string tmp = Path.Combine(Path.GetTempPath(), "mobius01-intro-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                string frames = Path.Combine(tmp, "frames"), nomods = Path.Combine(tmp, "mods");
+                Directory.CreateDirectory(frames);
+                Directory.CreateDirectory(nomods);
+                var env = new Dictionary<string, string>();
+                env["PS2_SHADER_DIR"] = Path.Combine(Builder.Runtime, "shaders");
+                env["PS2_TEXTURE_PACK"] = "off";
+                env["PS2_SAVE_DIR"] = Path.Combine(tmp, "saves");
+                env["PS2_SETTINGS_FILE"] = Path.Combine(tmp, "settings.ini");
+                env["PS2_PIPELINE_CACHE"] = Path.Combine(tmp, "pipelines");
+                env["PS2_MOD_DIR"] = nomods;
+                env["PS2_VFS_ALIAS"] = "SMV/SS01.SMV=SMV/INTRO.SMV";
+                env["PS2_PAD_SCRIPT"] = string.Format("{0}:START {1}:CROSS {2}:CROSS {3}:CROSS {4}:CROSS",
+                                                      at, at + 200, at + 400, at + 600, at + 800);
+                env["PS2_IPU_DUMP"] = frames + ":1:1730";
+                env["SDL_AUDIO_DRIVER"] = "dummy";
+                string image = Path.GetFullPath(Path.Combine(Builder.Runtime, @"..\..\gamedata\ps2_image.bin"));
+                if (File.Exists(image)) env["PS2_IMAGE"] = image;
+                int lines = 0;
+                double from = t == 0 ? 0 : 0.5, span = 0.45;
+                int rc = Exec(Builder.GameExe, "--data \"" + Builder.Runtime + "\" --disc \"" + Builder.IsoFile +
+                              "\" --hidden --vblanks " + vblanks + " --watchdog 0", tmp, env,
+                              s => { lines++; p(from + span * Math.Min(1.0, lines / 600.0)); });
+                if (rc != 0) Log("the hidden intro run ended with " + rc);
+                Log("intro run " + (t + 1) + ": " + Directory.GetFiles(frames, "INTRO_*.ppm").Length + " pictures saved");
+                var penv = ToolEnv();
+                penv["PYTHONDONTWRITEBYTECODE"] = "1";
+                rc = Exec(Path.Combine(Builder.Ucrt, "bin", "python.exe"),
+                          "-s tools/ac4_intro_text.py \"" + frames + "\" \"" + Path.Combine(Builder.SpanishModDir, "movies") + "\"",
+                          Builder.Src, penv, null);
+                made = rc == 0;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception e) { Log("intro text run failed: " + e.Message); }
+            finally { try { Directory.Delete(tmp, true); } catch { } }
+        }
+        if (!made)
+        {
+            Log("the intro text was not made; the intro ends in English");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Builder.IntroFailedMark));
+                File.WriteAllText(Builder.IntroFailedMark, "No se pudo preparar el texto en español del video de introducción " +
+                                  DateTime.Now.ToString("yyyy-MM-dd HH:mm") + ".\r\nBorra este archivo para que se intente otra vez al jugar.\r\n");
+            }
+            catch { }
+        }
         p(1);
     }
 

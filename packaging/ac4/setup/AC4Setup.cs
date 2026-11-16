@@ -758,6 +758,24 @@ class Wizard : Form
         ckPlay.Text = T("Abrir el juego al terminar (la primera vez se compila antes para tu PC)",
                         "Open the game when finished (the first time it is built for your PC first)");
         foreach (var b in bCredits) b.Text = T("Créditos y licencias", "Credits and licenses");
+        Flow();
+    }
+
+    // the path field, its buttons and the status line go below the help
+    // text, however many lines it takes in this language, font and DPI
+    void Flow()
+    {
+        FlowBelow(isoHelp, tbIso, new[] { bIso, bIsoDir }, isoState);
+        FlowBelow(dirHelp, tbDir, new[] { bDir }, dirState);
+    }
+
+    void FlowBelow(Label help, TextBox field, Button[] buttons, Label state)
+    {
+        int h = help.GetPreferredSize(new Size(help.MaximumSize.Width, 0)).Height;
+        int y = help.Top + h + Px(16);
+        field.Top = y;
+        foreach (var b in buttons) b.Top = y - Px(1);
+        state.Top = y + Math.Max(field.Height, buttons[0].Height) + Px(14);
     }
 
     static string CreditsText()
@@ -961,6 +979,7 @@ class Wizard : Form
                                             : ckTools.Checked ? T("Herramientas de compilación: se instalan (sin internet)", "Build tools: will be installed (no internet needed)")
                                                               : T("Sin herramientas: se usará la versión genérica del juego", "No build tools: the generic version of the game is used"));
         depList.Text = sb.ToString();
+        ckTools.Top = Math.Max(Px(408), depList.Top + depList.GetPreferredSize(new Size(depList.MaximumSize.Width, 0)).Height + Px(10));
         ckTools.Visible = page == 3 && !tools && !Product.ToolsRequired;
         ckTools.Text = T("Instalar las herramientas para optimizar el juego para esta PC (recomendado)",
                          "Install the tools that optimize the game for this PC (recommended)");

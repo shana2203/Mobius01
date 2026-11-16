@@ -928,10 +928,16 @@ class ConfigForm : Form
         Row(panel, "Idioma del juego", cbLang,
             "Subtítulos de la radio y de las cinemáticas, briefings, menús y descripciones. " +
             "Se aplica al iniciar el juego.");
-        if (!File.Exists(LangModManifest)) cbLang.Enabled = false;
+        Builder.Init(root);
+        // installed in English: the Spanish mod is made from the disc the next
+        // time the game starts, if Spanish is chosen here
+        bool canMake = !File.Exists(LangModManifest) && Builder.CanMakeSpanish;
+        if (!File.Exists(LangModManifest) && !canMake) cbLang.Enabled = false;
         var languageNote = new Label {
             Text = File.Exists(LangModManifest)
                 ? "El español se aplica al iniciar el juego; cambiarlo en plena partida requiere reiniciar."
+                : canMake
+                ? "Al elegir español, la traducción se genera desde tu disco la próxima vez que juegues (unos minutos, una sola vez)."
                 : "La traducción al español no está instalada (falta VulkanRuntime\\mods\\espanol).",
             AutoSize = true, MaximumSize = new Size(650, 0), Tag = "muted", ForeColor = Theme.Muted };
         panel.Controls.Add(new Label { AutoSize = true });
@@ -993,7 +999,7 @@ class ConfigForm : Form
     void LoadLanguage()
     {
         string lang = File.Exists(LangFile) ? File.ReadAllText(LangFile).Trim().ToLowerInvariant() : "en";
-        cbLang.SelectedIndex = lang.StartsWith("es") && File.Exists(LangModManifest) ? 1 : 0;
+        cbLang.SelectedIndex = lang.StartsWith("es") && (File.Exists(LangModManifest) || Builder.CanMakeSpanish) ? 1 : 0;
     }
 
     // The language is the "espanol" mod switched on or off (its manifest's
@@ -1980,6 +1986,7 @@ static class Program
             // automatic tests: the whole build with no window; the log is in
             // VulkanRuntime\logs (build-*.log, and build-headless-error.txt)
             Builder.Init(root);
+            if (args.Contains("--compilar")) Builder.ForceFull = true;
             if (Builder.RebuildReason() == null && !args.Contains("--compilar")) return 0;
             try { new BuildJob().Run(); return 0; }
             catch (Exception e)
@@ -1999,6 +2006,7 @@ static class Program
             Builder.Init(root);
             if (buildOnly && !args.Contains("--build-worker") && !Builder.IsElevated)
                 return Builder.EnsureReady(true, true) ? 0 : 1;
+            if (force || buildOnly) Builder.ForceFull = true;
             string reason = (force || buildOnly) ? "Compilación solicitada." : Builder.RebuildReason();
             if (reason == null) return (int)BuildResult.Ok;
             return (int)Builder.RunWindow(reason);

@@ -73,6 +73,14 @@ Compile $uninst @('/define:UNINSTALLER')
 $stage = & (Join-Path $here '..\..\make_package.ps1') -StageOnly | Select-Object -Last 1
 if (-not (Test-Path (Join-Path $stage 'Jugar.exe'))) { throw "make_package.ps1 no preparo la carpeta del juego ($stage)" }
 Copy-Item $uninst $stage
+# the launchers, compiled from this source (not the copies of the game folder,
+# which may be older or in use); the public download gets our own icon
+$refs = '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Core.dll'
+$cs = "$config\Config.cs", "$config\Builder.cs", "$config\Theme.cs"
+& $csc /nologo /target:winexe /optimize+ /codepage:65001 "/win32icon:$config\icon.ico" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/out:$stage\Configurar AC4.exe" @cs
+if ($LASTEXITCODE -ne 0) { throw 'csc fallo (Configurar AC4.exe)' }
+& $csc /nologo /target:winexe /optimize+ /codepage:65001 /define:PLAY_LAUNCHER "/win32icon:$config\$appIcon" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/out:$stage\Jugar.exe" @cs
+if ($LASTEXITCODE -ne 0) { throw 'csc fallo (Jugar.exe)' }
 Remove-Item (Join-Path $stage 'VulkanRuntime\runtime\ps2_image.bin') -ErrorAction SilentlyContinue
 # game data never ships: the source's copy of the image too (the installer
 # makes gamedata\ps2_image.bin from the player's ISO)
@@ -95,13 +103,6 @@ if ($Release) {
                    'VulkanRuntime\mods\mision_libre\files') {
         Remove-Item (Join-Path $stage $p) -Recurse -Force -ErrorAction SilentlyContinue
     }
-    # the launchers again, with our icon instead of the game's logo
-    $refs = '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Core.dll'
-    $cs = "$config\Config.cs", "$config\Builder.cs", "$config\Theme.cs"
-    & $csc /nologo /target:winexe /optimize+ /codepage:65001 "/win32icon:$config\icon.ico" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/out:$stage\Configurar AC4.exe" @cs
-    if ($LASTEXITCODE -ne 0) { throw 'csc fallo (Configurar AC4.exe)' }
-    & $csc /nologo /target:winexe /optimize+ /codepage:65001 /define:PLAY_LAUNCHER "/win32icon:$config\icon.ico" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/out:$stage\Jugar.exe" @cs
-    if ($LASTEXITCODE -ne 0) { throw 'csc fallo (Jugar.exe)' }
     Get-ChildItem (Join-Path $stage 'VulkanRuntime\icons') -Filter *.ico -ErrorAction SilentlyContinue |
         ForEach-Object { Copy-Item "$config\icon.ico" $_.FullName -Force }
     Copy-Item "$config\icon.ico" (Join-Path $src 'packaging\ac4\config\play.ico') -Force
