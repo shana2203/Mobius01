@@ -16,6 +16,6 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Listo: %OUT%
-"%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /define:PLAY_LAUNCHER /win32icon:play.ico %REFS% %RES% /out:"%~dp0..\..\..\..\..\AC4Recomp\Jugar.exe" Config.cs Builder.cs Theme.cs
+"%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /define:PLAY_LAUNCHER /win32icon:play.ico %REFS% %RES% /resource:splash.jpg,AC4.Splash.jpg /out:"%~dp0..\..\..\..\..\AC4Recomp\Jugar.exe" Config.cs Builder.cs Theme.cs
 if errorlevel 1 exit /b 1
 echo Listo: Jugar.exe

@@ -40,9 +40,9 @@ mods/
 field being issued, in PS2 pixels from the centre of the picture (the game's
 cameras put that centre at 2048,2048: camera+0x178/+0x17C).  Call them every
 field (from `ac4.on_field`); they go into the displayed frame as GS triangles,
-so they scale with the internal resolution and appear in F7 videos.  See
-`punteria_canon` for a world-to-screen projection with the camera matrix at
-camera+0xE0 (built by 001029E0).
+so they scale with the internal resolution and appear in F7 videos.  For a
+world-to-screen projection, the game's camera matrix is at camera+0xE0 (built
+by 001029E0).
 
 New mods use the `ac4` Lua table and `runtime/include/ac4mod.h` native API.
 Existing AC4 mods can still use the `ac5` table (an alias of the same table),

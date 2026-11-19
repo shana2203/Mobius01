@@ -1852,10 +1852,13 @@ class ConfigForm : Form
         if (diagnostic) { env["PS2_SPEED_LOG"] = "1"; env["PS2_FRAME_TIMINGS"] = csv; }
 
         Hide();
+        // the splash picture, centred, until the game's window shows (as AC5's port does)
+        Splash.Begin();
         // 1. shader/pipeline optimisation (instant when nothing changed)
         Run(exe, "--precompile", env, null);
         // 2. the game, its output kept as the session log
-        int rc = Run(exe, "--data \"" + runtime + "\" --disc \"" + disc + "\" --vblanks 0 --watchdog 0", env, log);
+        int rc = Run(exe, "--data \"" + runtime + "\" --disc \"" + disc + "\" --vblanks 0 --watchdog 0", env, log, true);
+        Splash.End();
         WarnAboutGpu(log);
         try
         {
@@ -1918,7 +1921,7 @@ class ConfigForm : Form
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     static extern bool AllowSetForegroundWindow(int processId);
 
-    static int Run(string exe, string args, Dictionary<string, string> env, string logPath)
+    static int Run(string exe, string args, Dictionary<string, string> env, string logPath, bool game = false)
     {
         // let the game's window take the foreground (keyboard focus), also
         // after the compile window of the first run has closed
@@ -1948,11 +1951,117 @@ class ConfigForm : Form
                     p.BeginOutputReadLine();
                     p.BeginErrorReadLine();
                 }
+                if (game) Splash.CloseWhenWindowShows(p);
                 p.WaitForExit();
                 return p.ExitCode;
             }
         }
         finally { if (w != null) w.Dispose(); }
+    }
+}
+
+/* The splash shown while the game starts: a borderless picture in the centre of
+   the screen that fades in, stays at least a few seconds and fades out when the
+   game's own window appears.  The full download embeds AC4.Splash.jpg; the
+   public one has none and shows the project's own art (AC4.Background.jpg). */
+static class Splash
+{
+    static Form form;
+    static Thread thread;
+    static DateTime shown;
+    static volatile bool closing;
+    const double MinSeconds = 3.0, MaxSeconds = 25.0;
+    [DllImport("gdi32.dll")] static extern IntPtr CreateRoundRectRgn(int l, int t, int r, int b, int w, int h);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+
+    static Image Picture()
+    {
+        foreach (string name in new[] { "AC4.Splash.jpg", "AC4.Background.jpg" })
+        {
+            var st = typeof(Splash).Assembly.GetManifestResourceStream(name);
+            if (st != null) return Image.FromStream(st);
+        }
+        return null;
+    }
+
+    public static void Begin()
+    {
+        if (thread != null) return;
+        Image img;
+        try { img = Picture(); } catch { return; }
+        if (img == null) return;
+        closing = false;
+        var ready = new ManualResetEvent(false);
+        thread = new Thread(() =>
+        {
+            try
+            {
+                Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+                double k = Math.Min(wa.Width * 0.55 / img.Width, wa.Height * 0.62 / img.Height);
+                var f = new Form
+                {
+                    FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.CenterScreen,
+                    ShowInTaskbar = false, TopMost = true, BackColor = Color.Black, Opacity = 0,
+                    ClientSize = new Size((int)(img.Width * k), (int)(img.Height * k)),
+                    BackgroundImage = img, BackgroundImageLayout = ImageLayout.Stretch, Text = "Ace Combat 04"
+                };
+                var t = new System.Windows.Forms.Timer { Interval = 15 };
+                t.Tick += (s, e) =>
+                {
+                    double age = (DateTime.Now - shown).TotalSeconds;
+                    if (closing && age >= MinSeconds || age >= MaxSeconds)
+                    {
+                        f.Opacity = Math.Max(0, f.Opacity - 0.06);
+                        if (f.Opacity <= 0) { t.Stop(); f.Close(); }
+                    }
+                    else if (f.Opacity < 1) f.Opacity = Math.Min(1, f.Opacity + 0.06);
+                };
+                // rounded corners, like the picture's own frame
+                {
+                    int rad = Math.Max(12, f.ClientSize.Width / 28);
+                    IntPtr rgn = CreateRoundRectRgn(0, 0, f.ClientSize.Width + 1, f.ClientSize.Height + 1, rad, rad);
+                    if (rgn != IntPtr.Zero) { f.Region = Region.FromHrgn(rgn); DeleteObject(rgn); }
+                }
+                f.Shown += (s, e) => { shown = DateTime.Now; t.Start(); ready.Set(); };
+                form = f;
+                Application.Run(f);
+            }
+            catch { }
+            finally { ready.Set(); }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
+        thread.Start();
+        ready.WaitOne(3000);
+    }
+
+    // a watcher: the splash goes when the game's window exists (or the game ended)
+    public static void CloseWhenWindowShows(Process p)
+    {
+        if (thread == null) return;
+        new Thread(() =>
+        {
+            try
+            {
+                while (!closing)
+                {
+                    if (p.HasExited) break;
+                    p.Refresh();
+                    if (p.MainWindowHandle != IntPtr.Zero) break;
+                    Thread.Sleep(100);
+                }
+            }
+            catch { }
+            closing = true;
+        }) { IsBackground = true }.Start();
+    }
+
+    public static void End()
+    {
+        closing = true;
+        var t = thread;
+        thread = null;
+        if (t != null) t.Join(4000);
     }
 }
 

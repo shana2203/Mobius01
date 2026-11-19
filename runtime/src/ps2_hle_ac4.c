@@ -114,6 +114,13 @@ static void snd_run(s16 *out, u32 n) {
 
 u64 ps2_ac4_snd_stream_samples(void) { return __atomic_load_n(&snd_stream_samples, __ATOMIC_RELAXED); }
 
+/* the movie sound: nonzero while an AutoDMA stream plays; *id counts streams
+   (a new movie, or the same one restarted) */
+int ps2_ac4_snd_stream_state(u64 *id) {
+    if (id) *id = __atomic_load_n(&snd_streams, __ATOMIC_RELAXED);
+    return __atomic_load_n(&snd.streaming, __ATOMIC_RELAXED) && snd.samples;
+}
+
 void ps2_ac4_snd_mix(s16 *out, u32 n) {
     pthread_mutex_lock(&snd_lock);
     snd_run(out, n);

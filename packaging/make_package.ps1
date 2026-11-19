@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..\AC4Recomp')).Path
 $game = Join-Path $root 'VulkanRuntime'
 $rt   = Join-Path $game 'runtime'
-$date = Get-Date -Format 'yyyyMMdd'
+$date = Get-Date -Format 'yyyy.MM.dd'
 $desk = [Environment]::GetFolderPath('Desktop')
 $stage = Join-Path $env:TEMP "AC4Recomp-package-$date"
 $out  = Join-Path $stage 'AC4Recomp'
@@ -52,6 +52,10 @@ foreach ($p in Get-ChildItem (Join-Path $g 'mods') -Recurse -Filter mod.toml | F
     if (-not ($t -match '^\s*enabled\s*=')) { $t = @('enabled = false') + $t }   # a missing line means "on"
     [IO.File]::WriteAllLines($p, [string[]]$t, (New-Object Text.UTF8Encoding $false))
 }
+
+# F6, the bug capturer, is on in this full download: ac4.exe looks for this
+# marker (setup\build_setup.ps1 -Release removes it from the public one)
+Set-Content -Path (Join-Path $g 'bugcapture.on') -Value 'F6 = captura de bugs (borrar este archivo para desactivarla)' -Encoding ASCII
 
 $r = Join-Path $g 'runtime'
 New-Item -ItemType Directory -Force $r | Out-Null

@@ -1,12 +1,14 @@
 #include "ps2_capture.h"
 #include "ps2_hle.h"
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #  include <direct.h>
 #endif
@@ -19,6 +21,7 @@ int g_cap_recording = 0;
 int g_cap_deep      = 0;
 int g_cap_shallow   = 0;
 int g_cap_disable   = 0;
+int ps2_bugcap_enabled = 0;   /* F6 allowed (ps2_main.c decides) */
 
 static void mkdir_one(const char *path) {
 #ifdef _WIN32
@@ -482,6 +485,38 @@ void ps2_cap_arm_at(u32 field) {
             g_cfg_level == PS2_CAP_LEVEL_DMA ? "dma" : "gs");
 }
 
+/* What the on-screen notice shows (ps2_ui.cpp): F6 armed, recording, then
+   where the file went or why it failed, for a few seconds. */
+static char   g_ui_msg[400];
+static double g_ui_msg_until;
+static int    g_ui_msg_err;
+static void cap_ui_message(int err, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_ui_msg, sizeof g_ui_msg, fmt, ap);
+    va_end(ap);
+    g_ui_msg_err = err;
+    g_ui_msg_until = ps2_wall_seconds() + 8.0;
+}
+static const char *cap_base_name(const char *p) {
+    const char *a = strrchr(p, '/'), *b = strrchr(p, 0x5C);
+    if (b > a) a = b;
+    return a ? a + 1 : p;
+}
+int ps2_cap_ui_status(char *msg, size_t n, double *secs, double *mb) {
+    if (g_cap_recording) {
+        if (secs) *secs = ps2_wall_seconds() - g_wall0;
+        if (mb) *mb = (double)g_stream_pos / (1024.0 * 1024.0);
+        return 2;
+    }
+    if (g_req_pending) return 1;
+    if (g_ui_msg[0] && ps2_wall_seconds() < g_ui_msg_until) {
+        if (msg && n) snprintf(msg, n, "%s", g_ui_msg);
+        return g_ui_msg_err ? 4 : 3;
+    }
+    return 0;
+}
+
 static void cap_stop_locked(const char *why);
 void ps2_cap_stop(const char *why) {
     cap_lock();
@@ -537,6 +572,12 @@ static void cap_stop_locked(const char *why) {
            why && *why ? why : "closed", g_index_n,
            (double)g_stream_pos / (1024.0 * 1024.0), g_path);
     fflush(stdout);
+    if (g_index_n)
+        cap_ui_message(0, "Captura guardada: %s (%.0f MB, %u cuadros)",
+                       cap_base_name(g_path), (double)g_stream_pos / (1024.0 * 1024.0),
+                       g_index_n);
+    else
+        cap_ui_message(1, "La captura quedo vacia (%s)", cap_base_name(g_path));
     free(g_index);
     g_index = NULL;
     g_index_n = g_index_cap = 0;
@@ -625,9 +666,27 @@ void ps2_cap_request(const char *path, int frames) {
 }
 
 void ps2_cap_toggle(void) {
+    char path[600];
     if (g_cap_recording) { g_stop_req = 1; return; }
-    ps2_cap_request_ex(g_cfg_path, g_cfg_frames, g_cfg_level);
-    ps2_log("cap: capture armed -- %s, %s, level %s", g_cfg_path,
+    if (g_cap_disable) {
+        cap_ui_message(1, "El capturador de bugs esta desactivado en esta sesion");
+        return;
+    }
+    {   /* every F6 capture gets its own file (capture-YYYYMMDD-HHMMSS.gscap):
+           a second F6 used to overwrite the first, and a bug caught once was
+           lost to the next try */
+        const char *dot = strrchr(g_cfg_path, '.');
+        const char *slash = strrchr(g_cfg_path, '/');
+        time_t t = time(NULL);
+        struct tm tmv, *tp = localtime(&t);
+        char stamp[32] = "";
+        if (tp) { tmv = *tp; strftime(stamp, sizeof stamp, "-%Y%m%d-%H%M%S", &tmv); }
+        if (!dot || (slash && dot < slash)) dot = g_cfg_path + strlen(g_cfg_path);
+        snprintf(path, sizeof path, "%.*s%s%s", (int)(dot - g_cfg_path), g_cfg_path,
+                 stamp, dot);
+    }
+    ps2_cap_request_ex(path, g_cfg_frames, g_cfg_level);
+    ps2_log("cap: capture armed -- %s, %s, level %s", path,
             g_cfg_frames ? "frame-limited" : "until stopped",
             g_cfg_level == PS2_CAP_LEVEL_DMA ? "dma" : "gs");
 }
@@ -726,7 +785,11 @@ static void cap_maybe_start_locked(void) {
         } }
 
     g_cf = fopen(g_path, "wb");
-    if (!g_cf) { ps2_log("cap: cannot open %s", g_path); return; }
+    if (!g_cf) {
+        ps2_log("cap: cannot open %s", g_path);
+        cap_ui_message(1, "No se pudo crear %s", g_path);
+        return;
+    }
 
     ps2_cap_dict_config((u32)cap_env_int("PS2_CAP_DICT_SLOTS", 0),
                         (u32)cap_env_int("PS2_CAP_DICT_MIN", 0),

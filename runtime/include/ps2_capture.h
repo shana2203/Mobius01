@@ -112,6 +112,7 @@ extern int g_cap_recording;
 extern int g_cap_deep;
 extern int g_cap_shallow;
 extern int g_cap_disable;
+extern int ps2_bugcap_enabled;
 
 void ps2_cap_maybe_start(void);
 
@@ -121,6 +122,8 @@ void ps2_cap_request_ex(const char *path, int frames, int level);
 void ps2_cap_toggle(void);
 void ps2_cap_stop(const char *why);
 int  ps2_cap_active(void);
+/* on-screen notice: 0 nothing, 1 armed, 2 recording (secs, MB), 3 saved, 4 error (msg) */
+int  ps2_cap_ui_status(char *msg, size_t n, double *secs, double *mb);
 void ps2_cap_configure(const char *path, int frames, int level);
 void ps2_cap_arm_at(u32 field);
 void ps2_cap_report(void);

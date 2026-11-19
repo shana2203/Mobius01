@@ -4916,18 +4916,22 @@ static void pump_events(void) {
                 __atomic_store_n(&rec_toggle, 1, __ATOMIC_RELAXED);
                 break;
             }
+            /* F6: the bug capturer, with an on-screen notice.  On in the full
+               download (bugcapture.on) and with PS2_DEV_KEYS; off in the
+               public release */
+            if (e.key.key == SDLK_F6 && !e.key.repeat && !window_hidden && ps2_bugcap_enabled) {
+                int was = ps2_cap_active();
+                ps2_cap_toggle();
+                printf(was ? "[F6] capture stopping at the next field...\n"
+                           : "[F6] capture armed; press F6 again to stop it\n");
+                fflush(stdout);
+                break;
+            }
             if (!PS2_ENV("PS2_DEV_KEYS")) goto not_dev_key;
             if (e.key.key == SDLK_F9) {
                 ps2_capture_request = 1;
                 ps2_log("capture: requested; the next field will be captured");
                 printf("[F9] capturing this screen...\n");
-                fflush(stdout);
-            }
-            if (e.key.key == SDLK_F6) {
-                int was = ps2_cap_active();
-                ps2_cap_toggle();
-                printf(was ? "[F6] capture stopping at the next field...\n"
-                           : "[F6] capture armed; press F6 again to stop it\n");
                 fflush(stdout);
             }
             if (e.key.key == SDLK_F7) {
@@ -6117,8 +6121,16 @@ int ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt) {
         if (at_hit || (shot_every > 0 && shot_calls >= shot_from
             && (shot_calls % (u64)shot_every) == 0)) {
             char nm[64];
+            /* PS2_SHOT_NAME=vblank names shots by field, the clock that
+               PS2_PAD_SCRIPT uses (presents lag fields by a varying amount) */
+            static int by_field = -1;
+            if (by_field < 0) {
+                const char *nmode = getenv("PS2_SHOT_NAME");
+                by_field = nmode && !strcmp(nmode, "vblank");
+            }
             snprintf(nm, sizeof nm, "out/shot_%06llu.ppm",
-                     (unsigned long long)shot_calls);
+                     (unsigned long long)(by_field ? ps2_kernel_vblank_count()
+                                                   : shot_calls));
             ps2_vk_screenshot(nm);
         }
         shot_calls++;

@@ -1123,6 +1123,63 @@ static void ipu_pace_picture(void) {
             ps2_log("ipu: movie pictures paced to one every %.2f ms (PS2_IPU_FRAME_MS)", period_ms);
     }
     if (period_ms <= 0.0) return;
+    {   /* Movies with sound (an AutoDMA stream: 48-kHz PCM from the SMV) follow
+           that sound.  On the PS2 the pictures and the sound run off one
+           clock; here the pictures follow the field timer and the sound the
+           host's audio device, and the two part: the 4m21s staff roll drifted
+           to 0.7 s of picture lead, then the player jumped its sound a second
+           to catch up.  So once a movie has run for a second, its lead over
+           the sound is kept: a picture early waits for the sound, a picture
+           late starts at once.  PS2_IPU_AUDIO_SYNC=0 turns it off;
+           PS2_IPU_SYNC_LOG=1 reports the lead every 300 pictures. */
+        static int slave = -1, sync_log;
+        static u64 sid_seen = ~0ull, p_base, s_base;
+        static int anchored;
+        static double lead0;
+        extern u64 ps2_ac4_snd_stream_samples(void);
+        extern int ps2_ac4_snd_stream_state(u64 *id);
+        u64 sid;
+        if (slave < 0) {
+            const char *e = getenv("PS2_IPU_AUDIO_SYNC");
+            slave = !(e && *e == '0');
+            sync_log = getenv("PS2_IPU_SYNC_LOG") ? 1 : 0;
+        }
+        if (slave && ps2_ac4_snd_stream_state(&sid)) {
+            u64 p, s;
+            double pt, st;
+            if (sid != sid_seen) {
+                sid_seen = sid;
+                anchored = 0;
+                p_base = pics_started;
+                s_base = ps2_ac4_snd_stream_samples();
+            }
+            p = pics_started - p_base;
+            s = ps2_ac4_snd_stream_samples() - s_base;
+            pt = (double)p * period_ms / 1000.0;
+            st = (double)s / 48000.0;
+            if (!anchored && p >= 30u) { anchored = 1; lead0 = pt - st; }
+            if (sync_log && p % 300u == 0u)
+                ps2_log("ipu-sync: %llu pictures = %.3f s, sound %.3f s, picture lead %+.3f s (kept at %+.3f)",
+                        (unsigned long long)p, pt, st, pt - st, anchored ? lead0 : 0.0);
+            if (anchored) {
+                /* bounded: a sound that stops (the movie ended, a pause) must
+                   not hold the EE more than three pictures */
+                u64 t0, deadline;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                t0 = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+                deadline = t0 + 3u * (u64)(period_ms * 1e6);
+                for (;;) {
+                    double lead = pt - (double)(ps2_ac4_snd_stream_samples() - s_base) / 48000.0;
+                    if (lead <= lead0 + 0.004 || !ps2_ac4_snd_stream_state(NULL)) break;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    if ((u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec >= deadline) break;
+                    sched_yield();
+                }
+                next = 0;
+                return;
+            }
+        }
+    }
     period = (u64)(period_ms * 1e6);
     clock_gettime(CLOCK_MONOTONIC, &ts);
     now = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;

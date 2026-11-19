@@ -327,8 +327,12 @@ static u16 pad_buttons(int port, const ps2_pad_state *st) {
         u64 now = ps2_kernel_vblank_count();
         if (!pad_script_parsed) pad_script_parse();
         for (unsigned i = 0; i < pad_script_n; i++)
-            if (now >= pad_script[i].field && now < pad_script[i].field + 8u)
+            if (now >= pad_script[i].field && now < pad_script[i].field + 8u) {
+                if (now == pad_script[i].field)
+                    ps2_log("pad: script press %04X at field %llu",
+                            pad_script[i].mask, (unsigned long long)now);
                 buttons |= pad_script[i].mask;
+            }
     }
     if (pad_autoplay && port == 0 && pad_reads > 240) {
         u64 phase = pad_reads % 150;

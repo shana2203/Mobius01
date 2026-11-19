@@ -18,6 +18,7 @@
 
 extern "C" void ps2_log(const char *fmt, ...);
 extern "C" void ps2_video_request_close(void);
+extern "C" int ps2_cap_ui_status(char *msg, size_t n, double *secs, double *mb);
 
 namespace {
 
@@ -1016,6 +1017,48 @@ void draw_rec() {
     ImGui::End();
 }
 
+/* F6 bug capture: a yellow notice top right while armed and recording, then
+   where the file went (or why it failed) for a few seconds */
+bool bugcap_overlay_wanted() {
+    return ps2_cap_ui_status(nullptr, 0, nullptr, nullptr) != 0;
+}
+
+void draw_bugcap() {
+    ImGuiIO &io = ImGui::GetIO();
+    char msg[400] = "";
+    double secs = 0.0, mb = 0.0;
+    int st = ps2_cap_ui_status(msg, sizeof msg, &secs, &mb);
+    if (!st) return;
+    /* below the F7 REC notice when both show */
+    float y = 10.0f * g_dpi + (rec_overlay_wanted() ? ImGui::GetFrameHeightWithSpacing() * 1.4f : 0.0f);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.0f * g_dpi, y),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
+                             | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing
+                             | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##bugcap", nullptr, f)) {
+        const ImVec4 yellow(1.0f, 0.82f, 0.2f, 1.0f), green(0.45f, 1.0f, 0.45f, 1.0f),
+                     red(1.0f, 0.4f, 0.35f, 1.0f);
+        if (st == 1) {
+            ImGui::TextColored(yellow, "CAPTURA DE BUG: empezando...");
+        } else if (st == 2) {
+            float r = ImGui::GetTextLineHeight() * 0.35f;
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            bool lit = std::fmod(secs, 1.0) < 0.6;
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(p.x + r, p.y + ImGui::GetTextLineHeight() * 0.5f), r,
+                lit ? IM_COL32(255, 210, 50, 255) : IM_COL32(130, 100, 20, 255));
+            ImGui::Dummy(ImVec2(r * 2.0f, ImGui::GetTextLineHeight()));
+            ImGui::SameLine();
+            ImGui::TextColored(yellow, "CAPTURANDO BUG  %.0f s  %.0f MB  (F6 para terminar)", secs, mb);
+        } else {
+            ImGui::TextColored(st == 3 ? green : red, "%s", msg);
+        }
+    }
+    ImGui::End();
+}
+
 bool draw_quit_prompt();
 
 void draw_menu() {
@@ -1212,7 +1255,8 @@ int ps2_ui_event(const SDL_Event *e) {
 }
 
 void ps2_ui_draw(VkCommandBuffer cmd) {
-    if (!g_init || (!g_visible && !ps2_cfg.show_fps && !rec_overlay_wanted())) return;
+    if (!g_init || (!g_visible && !ps2_cfg.show_fps && !rec_overlay_wanted()
+                    && !bugcap_overlay_wanted())) return;
     ImGuiIO &io = ImGui::GetIO();
     if (g_cap == CAP_PAD) io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     else io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -1224,6 +1268,7 @@ void ps2_ui_draw(VkCommandBuffer cmd) {
     ImGui::NewFrame();
     if (ps2_cfg.show_fps) draw_fps();
     draw_rec();
+    draw_bugcap();
     if (g_visible && g_quit_only) {
         if (!draw_quit_prompt()) ps2_ui_set_visible(0);
     } else if (g_visible) {

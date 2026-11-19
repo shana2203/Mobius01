@@ -41,7 +41,6 @@ licencia Apache 2.0, que se conserva junto con sus créditos (ver `NOTICE`,
 
   | Mod | Qué hace |
   |---|---|
-  | `punteria_canon` | Ayuda de puntería para el cañón |
   | `guiado_misiles` | Guiado de misiles ajustable |
   | `municion` | Munición extra |
   | `maniobrabilidad` | Ajustes de maniobrabilidad |

@@ -62,6 +62,11 @@ enum {
 #define PRIM_IIP (1u << 3)
 #define PRIM_TME (1u << 4)
 #define PRIM_ABE (1u << 6)
+#define PRIM_AA1 (1u << 7)
+/* AA1 on a line: the GS blends it even with ABE off, the alpha replaced by the
+   pixel's coverage (AC4's Megalith lasers are Gouraud lines with AA1 and an
+   additive ALPHA; drawn opaque, they were dark threads in the fog) */
+#define PRIM_AA_LINE() ((gs_prim & PRIM_AA1) && ((gs_prim & 7u) == PRIM_LINE                                                  || (gs_prim & 7u) == PRIM_LINESTRIP))
 #define PRIM_FST (1u << 8)
 #define PRIM_CTXT2 (1u << 9)
 
@@ -81,6 +86,7 @@ static gs_vtx gs_queue[3];
 static int gs_qn, gs_strip_parity;
 static u64 gs_stat_prims, gs_stat_pixels, gs_stat_regs;
 u64 ps2_gs_vtx_draw, ps2_gs_vtx_adc;
+extern u64 ps2_gs_prim_seq;
 static u64 gs_stat_trx, gs_stat_trxpix;
 static u64 gs_stat_deint;
 static u64 gs_stat_ws_hud, gs_stat_ws_cue;
@@ -879,7 +885,7 @@ static void shade_pixel(s32 x, s32 y, u32 z, u32 rgba, float s, float t, float q
         col = o;
     }
     if (!z_test_and_write((u32)x, (u32)y, z)) return;
-    if (gs_prim & PRIM_ABE) {
+    if ((gs_prim & PRIM_ABE) || PRIM_AA_LINE()) {
         u32 dst = vram_get(fb_base(), fb_width(), (u32)x, (u32)y,
                            (u32)((frame_reg() >> 24) & 0x3F));
         col = blend(col, dst);
@@ -2589,6 +2595,9 @@ static float z_norm(u32 z) {
 static u32 gs_rt_base[GS_RT_SLOTS];
 static u32 gs_rt_n;
 static u32 gs_rt_epoch[GS_RT_SLOTS];
+/* the last draw into each target, by primitive sequence: epochs only move
+   at uploads, so targets drawn one after the other in a field share one */
+static u64 gs_rt_lastprim[GS_RT_SLOTS];
 static u32 gs_rt_drawn[GS_RT_SLOTS];     /* primitives drawn into each target (overlay) */
 static u32 gs_rt_pages[GS_RT_SLOTS];
 static u32 gs_rt_fbw[GS_RT_SLOTS];      /* buffer width (pixels) of the last draw */
@@ -2620,6 +2629,7 @@ static u32 rt_slot(u32 base) {
         gs_rt_zframe[gs_rt_n] = 0;
         gs_rt_aepoch[gs_rt_n] = 0;
         gs_rt_cpu_alpha[gs_rt_n] = 0;
+        gs_rt_lastprim[gs_rt_n] = 0;
         return gs_rt_n++;
     }
     for (i = 0; i < gs_rt_n; i++) {
@@ -2638,6 +2648,7 @@ static u32 rt_slot(u32 base) {
     }
     gs_rt_base[victim] = base;
     gs_rt_epoch[victim] = 0;
+    gs_rt_lastprim[victim] = 0;
     gs_rt_pages[victim] = 0;
     gs_rt_zframe[victim] = 0;
     gs_rt_aepoch[victim] = 0;
@@ -2660,7 +2671,18 @@ static int rt_covering(u32 addr) {
         u32 span = (gs_rt_pages[i] ? gs_rt_pages[i] : 1u) * GS_PAGE_BYTES;
         if (!gs_rt_epoch[i] || addr < gs_rt_base[i] || addr >= gs_rt_base[i] + span)
             continue;
-        if (best < 0 || gs_rt_epoch[i] > gs_rt_epoch[best]) best = (int)i;
+        /* newest wins; between targets written in the same epoch, the one
+           drawn last, then the one that starts nearer (AC4 draws its sun-halo
+           palette into a 64-wide target inside a bigger bloom buffer it used
+           earlier: the bigger one, listed first, used to win the tie and the
+           halo read stale bloom -- a hard-edged bright square in missions 10
+           and 12) */
+        if (best < 0 || gs_rt_epoch[i] > gs_rt_epoch[best]
+            || (gs_rt_epoch[i] == gs_rt_epoch[best]
+                && (gs_rt_lastprim[i] > gs_rt_lastprim[best]
+                    || (gs_rt_lastprim[i] == gs_rt_lastprim[best]
+                        && gs_rt_base[i] > gs_rt_base[best]))))
+            best = (int)i;
     }
     return best;
 }
@@ -3243,7 +3265,7 @@ static void fill_state_compute(ps2_vk_state *st) {
     st->scissor[3] = (s32)((sc >> 48) & 0x7FFull);
     st->ztst = (u32)((tst >> 17) & 3ull);
     st->zwrite = zb_enabled() ? 1 : 0;
-    st->abe = (gs_prim & PRIM_ABE) ? 1 : 0;
+    st->abe = ((gs_prim & PRIM_ABE) || PRIM_AA_LINE()) ? 1 : 0;
     {   static int off = -1;
         if (off < 0) {
             const char *e = getenv("PS2_NO_COLCLIP");
@@ -3304,6 +3326,14 @@ static void fill_state_compute(ps2_vk_state *st) {
     if (st->rt < GS_RT_SLOTS) {
         gs_rt_drawn[st->rt]++;
         gs_rt_epoch[st->rt] = gs_epoch_seq;
+        gs_rt_lastprim[st->rt] = ps2_gs_prim_seq;
+        if (PS2_UNLIKELY(gs_rt_fbw[st->rt] != st->fb_w) && PS2_ENV("PS2_TRACE_RT_FBW")) {
+            static u32 said;
+            if (said++ < 400u)
+                ps2_log("rt-fbw: field %u rt%u fbp=%u fbw %u -> %u psm %u mask %08X at prim seq %llu",
+                        ps2_gs_frame_count, st->rt, fb_base(), gs_rt_fbw[st->rt], st->fb_w,
+                        st->fb_psm, st->fb_mask, (unsigned long long)ps2_gs_prim_seq);
+        }
         gs_rt_fbw[st->rt] = st->fb_w;
         gs_rt_psm[st->rt] = (u8)st->fb_psm;
         if (st->fb_psm == PSM_CT32 && (st->fb_mask >> 24) != 0xFFu) {
@@ -3471,6 +3501,29 @@ static void fill_state_compute(ps2_vk_state *st) {
                     st->clut_rt = (u32)cs + 1u;
                     st->clut_four = tpsm == PSM_T4 || tpsm == PSM_T4HL || tpsm == PSM_T4HH;
                     fill_no_memo = 1;
+                    if (PS2_ENV("PS2_TRACE_CLUT_RT")) {
+                        static u64 seen[32];
+                        static u32 ns;
+                        u32 k;
+                        for (k = 0; k < ns && seen[k] != t0; k++) {}
+                        if (k == ns && ns < 32u) {
+                            seen[ns++] = t0;
+                            ps2_log("clut-rt: field %u TEX0=%016llX tbp=%u psm=%u cbp=%u "
+                                    "in rt%d (fbp %u psm %u fbw %u) at (%u,%u) csa=%u into rt%u",
+                                    ps2_gs_frame_count, (unsigned long long)t0,
+                                    (u32)(t0 & 0x3FFFull) * 256u, tpsm, cbp, cs,
+                                    gs_rt_base[cs], (u32)gs_rt_psm[cs], gs_rt_fbw[cs],
+                                    st->clut_xy & 0xFFFFu, st->clut_xy >> 16,
+                                    (u32)((t0 >> 56) & 0x1Full), st->rt);
+                            for (k = 0; k < gs_rt_n; k++)
+                                if (cbp >= gs_rt_base[k]
+                                    && cbp < gs_rt_base[k] + (gs_rt_pages[k] ? gs_rt_pages[k] : 1u) * GS_PAGE_BYTES)
+                                    ps2_log("clut-rt:   covering rt%u base %u pages %u fbw %u epoch %u",
+                                            k, gs_rt_base[k], gs_rt_pages[k], gs_rt_fbw[k], gs_rt_epoch[k]);
+                            ps2_log("clut-rt:   exact slot %d, range epoch %u",
+                                    rt_find(cbp), gs_range_epoch(cbp, cbp + 1u));
+                        }
+                    }
                 }
             }
             tex_index_mode = st->clut_rt != 0;
@@ -3607,7 +3660,7 @@ static struct {
 static unsigned drawc_n;
 static u64 drawc_dropped;
 static u64 drawc_seq;
-u64 ps2_gs_prim_seq;
+u64 ps2_gs_prim_seq;   /* declared early too (extern) */
 
 #define BLITLOG_N 128
 static struct {
@@ -3915,6 +3968,7 @@ static void vk_vertex(ps2_vk_vertex *o, const gs_vtx *v, int iip,
     o->g = (float)((c->rgba >> 8) & 0xFF);
     o->b = (float)((c->rgba >> 16) & 0xFF);
     o->a = (float)((c->rgba >> 24) & 0xFF);
+    if (PRIM_AA_LINE()) o->a = 128.0f;     /* coverage of a 1-pixel line */
     if (fst) { float m = 16.0f * (float)(1u << lod);
                o->s = (float)v->u / m; o->t = (float)v->v / m; o->q = 1.0f; }
     else     { o->s = v->s; o->t = v->t; o->q = v->q; }
@@ -4835,6 +4889,16 @@ void ps2_gs_write_reg(u32 reg, u64 val) {
         gs_reg_hist[reg]++;
         if (gs_reg[reg] != val && !gs_reg_is_data[reg]) gs_state_ver++;
         gs_reg[reg] = val;
+    }
+    if (PS2_UNLIKELY((reg == GS_TEX0_1 || reg == GS_TEX0_2) && PS2_ENV("PS2_TRACE_TEX0_CBP"))) {
+        static long want = -2;
+        static u32 said;
+        if (want == -2) want = strtol(getenv("PS2_TRACE_TEX0_CBP"), NULL, 0);
+        if ((long)(((val >> 37) & 0x3FFFull) * 256u) == want && said++ < 400u)
+            ps2_log("tex0: field %u %s=%016llX cld=%u at prim seq %llu",
+                    ps2_gs_frame_count, reg == GS_TEX0_1 ? "TEX0_1" : "TEX0_2",
+                    (unsigned long long)val, (u32)(val >> 61),
+                    (unsigned long long)ps2_gs_prim_seq);
     }
     switch (reg) {
     case GS_PRIM:

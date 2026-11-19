@@ -24,7 +24,7 @@ $creditsEn = (Resolve-Path (Join-Path $here '..\..\..\..\..\AC4Recomp\CREDITS.md
 $bash   = Join-Path $msys 'usr\bin\bash.exe'
 $work   = Join-Path $env:TEMP 'AC4Recomp-setup-build'
 $cache  = Join-Path (Resolve-Path (Join-Path $here '..\..\..\..')).Path 'setup-cache'   # AC4Recomp-desarrollo\setup-cache
-$date   = Get-Date -Format 'yyyyMMdd'
+$date   = Get-Date -Format 'yyyy.MM.dd'
 $version = Get-Date -Format 'yyyy.MM.dd'
 $out    = Join-Path ([Environment]::GetFolderPath('Desktop')) "Mobius01-Setup-$date.exe"
 if ($Release) {
@@ -79,7 +79,7 @@ $refs = '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Core.
 $cs = "$config\Config.cs", "$config\Builder.cs", "$config\Theme.cs"
 & $csc /nologo /target:winexe /optimize+ /codepage:65001 "/win32icon:$config\icon.ico" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/out:$stage\Configurar AC4.exe" @cs
 if ($LASTEXITCODE -ne 0) { throw 'csc fallo (Configurar AC4.exe)' }
-& $csc /nologo /target:winexe /optimize+ /codepage:65001 /define:PLAY_LAUNCHER "/win32icon:$config\$appIcon" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/out:$stage\Jugar.exe" @cs
+& $csc /nologo /target:winexe /optimize+ /codepage:65001 /define:PLAY_LAUNCHER "/win32icon:$config\$appIcon" @refs "/resource:$config\build-bg.jpg,AC4.Background.jpg" "/resource:$config\splash.jpg,AC4.Splash.jpg" "/out:$stage\Jugar.exe" @cs
 if ($LASTEXITCODE -ne 0) { throw 'csc fallo (Jugar.exe)' }
 Remove-Item (Join-Path $stage 'VulkanRuntime\runtime\ps2_image.bin') -ErrorAction SilentlyContinue
 # game data never ships: the source's copy of the image too (the installer
@@ -95,6 +95,10 @@ if ($Release) {
         Remove-Item (Join-Path $src $p) -Recurse -Force -ErrorAction SilentlyContinue
     }
     Remove-Item (Join-Path $stage 'VulkanRuntime\runtime\ac4.exe') -Force -ErrorAction SilentlyContinue
+    # no bug capturer (F6) in the public download
+    Remove-Item (Join-Path $stage 'VulkanRuntime\bugcapture.on') -Force -ErrorAction SilentlyContinue
+    # the gun aim-assist mod (punteria_canon) is personal: not in the public download
+    Remove-Item (Join-Path $stage 'VulkanRuntime\mods\punteria_canon') -Recurse -Force -ErrorAction SilentlyContinue
     # nothing made from the game's files: the Spanish mod (text patches, HUD,
     # cards, movie overlays) is generated from the player's ISO on the first
     # start (tools/ac4_espanol_mod.py), and the retouched HD textures, which

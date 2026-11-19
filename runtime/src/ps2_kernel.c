@@ -1341,6 +1341,18 @@ static void *vblank_timer(void *unused) {
         deadline = next_field_deadline(deadline, fns);
         now = mono_ns();
         if (now > deadline + 4ull * fns) deadline = now + fns;
+        {   /* PS2_FIELD_WAIT=1 (tests): never drop a field; wait for the
+               guest instead, so a scripted run sees the same field numbers
+               however slow the host is (screenshots, tracing) */
+            static int wait_fields = -1;
+            if (wait_fields < 0) wait_fields = getenv("PS2_FIELD_WAIT") ? 1 : 0;
+            if (wait_fields) {
+                while (vblank_running
+                       && __atomic_load_n(&vblank_pending, __ATOMIC_RELAXED) >= 2)
+                    { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+                deadline = mono_ns() + fns;
+            }
+        }
         if (__atomic_load_n(&vblank_pending, __ATOMIC_RELAXED) < 4)
             __atomic_fetch_add(&vblank_pending, 1, __ATOMIC_SEQ_CST);
         else

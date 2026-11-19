@@ -528,6 +528,20 @@ int main(int argc, char **argv) {
             name = "normal (could not raise it)";
         ps2_log("process priority: %s (PS2_PRIORITY)", name);
     }
+    {   /* Windows 11 puts a process with no visible window (or one in the
+           background) in "efficiency mode": slower cores, coarse timers.  The
+           game then runs at half speed hidden or alt-tabbed and drops fields.
+           Opt out of execution-speed and timer-resolution throttling. */
+        typedef struct { ULONG Version, ControlMask, StateMask; } pt_state;
+        typedef BOOL (WINAPI *spi_fn)(HANDLE, int, LPVOID, DWORD);
+        spi_fn spi = (spi_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                    "SetProcessInformation");
+        pt_state st = { 1, 0x1 | 0x4, 0 };   /* EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION */
+        if (spi && !spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof st)) {
+            st.ControlMask = 0x1;            /* older Windows 10: speed only */
+            spi(GetCurrentProcess(), 4, &st, sizeof st);
+        }
+    }
 #endif
 
     for (int i = 1; i < argc; i++) {
@@ -691,6 +705,19 @@ int main(int argc, char **argv) {
     ps2_kernel_init();
     ps2_pad_autoplay(want_autoplay);
     ps2_gs_deinterlace(!want_deint);
+    {   /* F6, the bug capturer: only in the full download (it ships the
+           marker VulkanRuntimeugcapture.on) or with PS2_DEV_KEYS
+           (CAPTURAR_BUG.bat / DIAGNOSTICS.bat); the public release has no
+           marker, so F6 does nothing there */
+        char mk[1024];
+        FILE *f;
+        snprintf(mk, sizeof mk, "%s/../bugcapture.on", dir);
+        f = fopen(mk, "rb");
+        if (!f) { snprintf(mk, sizeof mk, "%s/bugcapture.on", dir); f = fopen(mk, "rb"); }
+        ps2_bugcap_enabled = f || getenv("PS2_DEV_KEYS") ? 1 : 0;
+        if (f) fclose(f);
+        ps2_log("bug capture (F6): %s", ps2_bugcap_enabled ? "on" : "off (no bugcapture.on)");
+    }
     if (cap_path || cap_frames >= 0 || cap_level >= 0 || cap_at >= 0) {
         ps2_mkdir_p("out");
         ps2_cap_configure(cap_path, cap_frames, cap_level);
